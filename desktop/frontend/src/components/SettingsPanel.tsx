@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent, type PointerEvent, type ReactNode } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Check, CheckCircle2, ChevronDown, Loader2, QrCode, RefreshCw } from "lucide-react";
+import { Check, CheckCircle2, ChevronDown, ChevronUp, GripVertical, Loader2, QrCode, RefreshCw } from "lucide-react";
 import { asArray } from "../lib/array";
 import { useDeferredClose } from "../lib/useMountTransition";
 import { app } from "../lib/bridge";
@@ -20,15 +20,18 @@ import {
 import { TEXT_SIZES, applyTextSize, getTextSize, type TextSize } from "../lib/textSize";
 import { FONT_FAMILIES, applyFontFamily, getFontFamily, type FontFamily } from "../lib/fontFamily";
 import { getDisplayMode, onDisplayModeChange, setDisplayMode as setLocalDisplayMode } from "../lib/displayMode";
-import type { BotConnectionView, BotInstallStartResult, BotSettingsView, NetworkView, ProviderView, SettingsTab, SettingsView } from "../lib/types";
+import { DEFAULT_STATUS_BAR_ITEMS, normalizeStatusBarItems, type StatusBarItemId } from "../lib/statusBarItems";
+import type { BotConnectionView, BotInstallStartResult, BotSettingsView, HookConfigView, HooksSettingsView, NetworkView, ProviderView, SettingsTab, SettingsView } from "../lib/types";
 import { InlineConfirmButton } from "./InlineConfirmButton";
 import { Tooltip } from "./Tooltip";
 import { AnchoredPopover } from "./AnchoredPopover";
 import { MCPServersSettingsPage, SkillsSettingsPage } from "./CapabilitiesPanel";
 import { MemorySettingsPage } from "./MemoryPanel";
+import { SoundSelect } from "./SoundSelect";
+import { getSuccessPreference, setSuccessPreference, getAttentionPreference, setAttentionPreference, playSuccessChime, playAttentionChime, type SoundWavPref } from "../lib/sound";
 import { ModalCloseButton } from "./ModalCloseButton";
 
-const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "skills", "memory", "permissions", "sandbox", "network", "appearance", "updates"];
+const SETTINGS_TABS: SettingsTab[] = ["general", "models", "bots", "mcp", "skills", "memory", "hooks", "permissions", "sandbox", "network", "appearance", "updates"];
 
 // SettingsPanel is the desktop settings centre — a centred modal with left
 // navigation and a right content area. It hosts all settings pages plus MCP,
@@ -131,6 +134,7 @@ export function SettingsPanel({ onClose, onChanged, initialTab, isDevBuild }: { 
                 {tab === "mcp" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><MCPServersSettingsPage /></SettingsPageShell>}
                 {tab === "skills" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><SkillsSettingsPage /></SettingsPageShell>}
                 {tab === "memory" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><MemorySettingsPage /></SettingsPageShell>}
+                {tab === "hooks" && <SettingsPageShell key={tab} s={s} tab={tab} busy={false} apply={apply}><HooksSection onChanged={onChanged} /></SettingsPageShell>}
                 {tab === "permissions" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><PermissionsSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
                 {tab === "sandbox" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><SandboxSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
                 {tab === "network" && s && <SettingsPageShell key={tab} s={s} tab={tab} busy={busy} apply={apply}><NetworkSection s={s} busy={busy} apply={apply} /></SettingsPageShell>}
@@ -188,7 +192,7 @@ function SettingsPageShell({ s: _s, tab, children }: { s: SettingsView | null; t
   const descKey = `settings.pageDesc.${tab}` as keyof typeof import("../locales/en").en;
   const desc = t(descKey as any);
   return (
-    <div className={`settings-page settings-page--${settingsPageKind(tab)}`}>
+    <div className={`settings-page settings-page--${settingsPageKind(tab)} settings-page--${tab}`}>
       <div className="settings-page__header">
         <h2 className="settings-page__title">{settingsTabPageTitle(tab, t)}</h2>
         {typeof desc === "string" && desc !== `settings.pageDesc.${tab}` && <p className="settings-page__desc">{desc}</p>}
@@ -310,6 +314,8 @@ function settingsTabLabel(id: SettingsTab, t: ReturnType<typeof useT>): string {
       return t("settings.tab.skills");
     case "memory":
       return t("settings.tab.memory");
+    case "hooks":
+      return t("settings.tab.hooks");
     case "network":
       return t("settings.tab.network");
     case "permissions":
@@ -339,6 +345,8 @@ function settingsTabMeta(id: SettingsTab, s: SettingsView, t: ReturnType<typeof 
       return t("caps.skillsTab");
     case "memory":
       return t("settings.tabSub.memory");
+    case "hooks":
+      return t("settings.tabSub.hooks");
     case "network":
       return proxyModeLabel(normalizeProxyMode(s.network.proxyMode), t);
     case "permissions":
@@ -537,7 +545,7 @@ function normalizeBotMappingScope(scope: unknown, workspaceRoot: unknown): "glob
 function normalizeSettingsView(view: SettingsView | null | undefined): SettingsView | null {
   if (!view) return null;
   const permissions = view.permissions ?? { mode: "ask", allow: [], ask: [], deny: [] };
-  const sandbox = view.sandbox ?? { bash: "enforce", network: false, workspaceRoot: "", allowWrite: [] };
+  const sandbox = view.sandbox ?? { bash: "enforce", network: false, workspaceRoot: "", allowWrite: [], shell: "auto" };
   const network = view.network ?? {
     proxyMode: "auto",
     proxyUrl: "",
@@ -583,6 +591,8 @@ function normalizeSettingsView(view: SettingsView | null | undefined): SettingsV
     desktopThemeStyle: normalizeThemeStyleForTheme(view.desktopThemeStyle, normalizeThemePreference(view.desktopTheme)),
     closeBehavior: normalizeCloseBehavior(view.closeBehavior),
     displayMode: normalizeDisplayMode(view.displayMode),
+    statusBarStyle: normalizeStatusBarStyle(view.statusBarStyle),
+    statusBarItems: normalizeStatusBarItems(view.statusBarItems),
     checkUpdates: view.checkUpdates !== false,
   };
 }
@@ -597,6 +607,44 @@ type DisplayMode = "standard" | "compact" | "minimal";
 
 function normalizeDisplayMode(mode: string | undefined): DisplayMode {
   return mode === "standard" || mode === "compact" || mode === "minimal" ? mode : "minimal";
+}
+
+type StatusBarStyle = "icon" | "text";
+type StatusBarDropPlacement = "before" | "after";
+type StatusBarDragTarget = {
+  id: StatusBarItemId;
+  placement: StatusBarDropPlacement;
+};
+
+function normalizeStatusBarStyle(style: string | undefined): StatusBarStyle {
+  return style === "icon" ? "icon" : "text";
+}
+
+function statusBarItemLabel(id: StatusBarItemId, t: ReturnType<typeof useT>): string {
+  switch (id) {
+    case "model":
+      return t("settings.statusBarItem.model");
+    case "cache":
+      return t("status.cacheLabel");
+    case "cache_avg":
+      return t("status.cacheAvgLabel");
+    case "session_tokens":
+      return t("status.sessionTokensLabel");
+    case "turn_tokens":
+      return t("status.turnTokensLabel");
+    case "turn_cost":
+      return t("status.turnCostLabel");
+    case "session_turns":
+      return t("status.sessionTurnsLabel");
+    case "context":
+      return t("status.ctxLabel");
+    case "compact":
+      return t("status.compactLabel");
+    case "cost":
+      return t("status.costLabel");
+    case "balance":
+      return t("status.balanceLabel");
+  }
 }
 
 function closeBehaviorLabel(mode: CloseBehavior, t: ReturnType<typeof useT>): string {
@@ -635,9 +683,164 @@ function GeneralSection({ s, busy, apply }: SectionProps) {
   const { t, setPref } = useI18n();
   const closeBehavior = normalizeCloseBehavior(s.closeBehavior);
   const [displayMode, setDisplayMode] = useState<DisplayMode>(() => normalizeDisplayMode(getDisplayMode()));
+  const [statusBarItemsExpanded, setStatusBarItemsExpanded] = useState(false);
+  const [draggingStatusBarItem, setDraggingStatusBarItem] = useState<StatusBarItemId | null>(null);
+  const [statusBarDragTarget, setStatusBarDragTargetState] = useState<StatusBarDragTarget | null>(null);
+  const draggingStatusBarItemRef = useRef<StatusBarItemId | null>(null);
+  const statusBarDragTargetRef = useRef<StatusBarDragTarget | null>(null);
+  const mouseDragCleanupRef = useRef<(() => void) | null>(null);
+  const statusBarItemsPanelId = useId();
   useEffect(() => onDisplayModeChange((mode) => setDisplayMode(mode)), []);
+  useEffect(() => () => mouseDragCleanupRef.current?.(), []);
   const autoPlan = normalizeAutoPlan(s.autoPlan);
   const languagePref = normalizeLangPref(s.desktopLanguage);
+  const [soundPref, setSoundPref] = useState<SoundWavPref>(getSuccessPreference());
+  const [attentionPref, setAttentionPref] = useState<SoundWavPref>(getAttentionPreference());
+  const statusBarStyle = normalizeStatusBarStyle(s.statusBarStyle);
+  const statusBarItems = normalizeStatusBarItems(s.statusBarItems);
+  const visibleStatusItems = new Set<StatusBarItemId>(statusBarItems);
+  const orderedStatusItems = [
+    ...statusBarItems,
+    ...DEFAULT_STATUS_BAR_ITEMS.filter((id) => !visibleStatusItems.has(id)),
+  ];
+  const applyStatusBarItems = (items: StatusBarItemId[]) => {
+    const contentScrollTop = document.querySelector<HTMLElement>(".settings-center__content")?.scrollTop ?? 0;
+    const navScrollTop = document.querySelector<HTMLElement>(".settings-center__nav")?.scrollTop ?? 0;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active.closest(".status-bar-items-editor")) active.blur();
+    void apply(() => app.SetStatusBarItems(items)).finally(() => {
+      window.scrollTo(0, 0);
+      requestAnimationFrame(() => {
+        window.scrollTo(0, 0);
+        const content = document.querySelector<HTMLElement>(".settings-center__content");
+        const nav = document.querySelector<HTMLElement>(".settings-center__nav");
+        if (content) content.scrollTop = Math.min(contentScrollTop, Math.max(0, content.scrollHeight - content.clientHeight));
+        if (nav) nav.scrollTop = navScrollTop;
+      });
+    });
+  };
+  const toggleStatusBarItem = (id: StatusBarItemId) => {
+    if (visibleStatusItems.has(id)) {
+      if (statusBarItems.length <= 1) return;
+      applyStatusBarItems(statusBarItems.filter((item) => item !== id));
+      return;
+    }
+    applyStatusBarItems([...statusBarItems, id]);
+  };
+  const moveStatusBarItem = (id: StatusBarItemId, direction: -1 | 1) => {
+    const idx = statusBarItems.indexOf(id);
+    const nextIdx = idx + direction;
+    if (idx < 0 || nextIdx < 0 || nextIdx >= statusBarItems.length) return;
+    const next = [...statusBarItems];
+    [next[idx], next[nextIdx]] = [next[nextIdx], next[idx]];
+    applyStatusBarItems(next);
+  };
+  const reorderStatusBarItem = (fromId: StatusBarItemId, toId: StatusBarItemId, placement: StatusBarDropPlacement) => {
+    const fromIdx = statusBarItems.indexOf(fromId);
+    const toIdx = statusBarItems.indexOf(toId);
+    if (fromIdx < 0 || toIdx < 0 || fromIdx === toIdx) return;
+    const next = statusBarItems.filter((item) => item !== fromId);
+    const insertAt = next.indexOf(toId);
+    if (insertAt < 0) return;
+    next.splice(placement === "after" ? insertAt + 1 : insertAt, 0, fromId);
+    if (next.every((item, index) => item === statusBarItems[index])) return;
+    applyStatusBarItems(next);
+  };
+  const statusBarItemFromPoint = (x: number, y: number): StatusBarDragTarget | null => {
+    const row = document.elementFromPoint(x, y)?.closest<HTMLElement>("[data-statusbar-setting-item]");
+    const id = row?.dataset.statusbarSettingItem as StatusBarItemId | undefined;
+    if (!row || !id || !statusBarItems.includes(id)) return null;
+    const rect = row.getBoundingClientRect();
+    return { id, placement: y < rect.top + rect.height / 2 ? "before" : "after" };
+  };
+  const setStatusBarDragTarget = (target: StatusBarDragTarget | null) => {
+    const current = statusBarDragTargetRef.current;
+    if (current?.id === target?.id && current?.placement === target?.placement) return;
+    statusBarDragTargetRef.current = target;
+    setStatusBarDragTargetState(target);
+  };
+  const beginStatusBarDrag = (id: StatusBarItemId, visible: boolean): boolean => {
+    if (busy || !visible) return false;
+    mouseDragCleanupRef.current?.();
+    mouseDragCleanupRef.current = null;
+    draggingStatusBarItemRef.current = id;
+    statusBarDragTargetRef.current = null;
+    setDraggingStatusBarItem(id);
+    setStatusBarDragTargetState(null);
+    return true;
+  };
+  const updateStatusBarDrag = (clientX: number, clientY: number) => {
+    const draggingId = draggingStatusBarItemRef.current;
+    if (!draggingId) return;
+    const target = statusBarItemFromPoint(clientX, clientY);
+    setStatusBarDragTarget(target && target.id !== draggingId ? target : null);
+  };
+  const finishStatusBarDrag = (clientX?: number, clientY?: number) => {
+    const draggingId = draggingStatusBarItemRef.current;
+    let target = statusBarDragTargetRef.current;
+    if (draggingId && clientX !== undefined && clientY !== undefined) {
+      const pointerTarget = statusBarItemFromPoint(clientX, clientY);
+      if (pointerTarget && pointerTarget.id !== draggingId) target = pointerTarget;
+    }
+    if (draggingId && target) reorderStatusBarItem(draggingId, target.id, target.placement);
+    draggingStatusBarItemRef.current = null;
+    statusBarDragTargetRef.current = null;
+    setDraggingStatusBarItem(null);
+    setStatusBarDragTargetState(null);
+  };
+  const cancelStatusBarDrag = () => {
+    mouseDragCleanupRef.current?.();
+    mouseDragCleanupRef.current = null;
+    draggingStatusBarItemRef.current = null;
+    statusBarDragTargetRef.current = null;
+    setDraggingStatusBarItem(null);
+    setStatusBarDragTargetState(null);
+  };
+  const startStatusBarPointerDrag = (event: PointerEvent<HTMLElement>, id: StatusBarItemId, visible: boolean) => {
+    if (event.button !== 0 || !beginStatusBarDrag(id, visible)) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+  const moveStatusBarPointerDrag = (event: PointerEvent<HTMLElement>) => {
+    if (!draggingStatusBarItemRef.current) return;
+    event.preventDefault();
+    updateStatusBarDrag(event.clientX, event.clientY);
+  };
+  const endStatusBarPointerDrag = (event: PointerEvent<HTMLElement>) => {
+    if (!draggingStatusBarItemRef.current) return;
+    event.preventDefault();
+    try {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture may already be released by the browser.
+    }
+    finishStatusBarDrag(event.clientX, event.clientY);
+  };
+  const cancelStatusBarPointerDrag = (event: PointerEvent<HTMLElement>) => {
+    event.preventDefault();
+    cancelStatusBarDrag();
+  };
+  const startStatusBarMouseDrag = (event: ReactMouseEvent<HTMLElement>, id: StatusBarItemId, visible: boolean) => {
+    if (event.button !== 0 || !beginStatusBarDrag(id, visible)) return;
+    event.preventDefault();
+    const handleMove = (moveEvent: MouseEvent) => {
+      moveEvent.preventDefault();
+      updateStatusBarDrag(moveEvent.clientX, moveEvent.clientY);
+    };
+    const cleanup = () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+    const handleUp = (upEvent: MouseEvent) => {
+      upEvent.preventDefault();
+      cleanup();
+      mouseDragCleanupRef.current = null;
+      finishStatusBarDrag(upEvent.clientX, upEvent.clientY);
+    };
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    mouseDragCleanupRef.current = cleanup;
+  };
   const setLanguage = (next: LangPref) => {
     setPref(next);
     void apply(() => app.SetDesktopLanguage(next));
@@ -715,6 +918,150 @@ function GeneralSection({ s, busy, apply }: SectionProps) {
               {t(`settings.autoPlan.${mode}`)}
             </button>
           ))}
+        </div>
+      </SettingsField>
+      <SettingsField label={t("settings.notificationSound")} hint={t("settings.notificationSoundHint")} stacked>
+        <div className="settings-notification-sound-row">
+          <span>{t("settings.notificationSoundSuccess")}</span>
+          <SoundSelect
+            value={soundPref}
+            onChange={(next) => {
+              setSoundPref(next);
+              setSuccessPreference(next);
+              playSuccessChime();
+            }}
+            onPreview={playSuccessChime}
+            previewDisabled={soundPref === "off"}
+          />
+        </div>
+        <div className="settings-notification-sound-row" style={{ marginTop: 6 }}>
+          <span>{t("settings.notificationSoundAttention")}</span>
+          <SoundSelect
+            value={attentionPref}
+            onChange={(next) => {
+              setAttentionPref(next);
+              setAttentionPreference(next);
+              playAttentionChime();
+            }}
+            onPreview={playAttentionChime}
+            previewDisabled={attentionPref === "off"}
+          />
+        </div>
+      </SettingsField>
+      <SettingsField label={t("settings.statusBarStyle")}>
+        <div className="set-seg">
+          {(["icon", "text"] as const).map((style) => (
+            <button
+              key={style}
+              className={`set-seg__btn${statusBarStyle === style ? " set-seg__btn--on" : ""}`}
+              disabled={busy}
+              onClick={() => void apply(() => app.SetStatusBarStyle(style))}
+            >
+              {t(`settings.statusBarStyle.${style}`)}
+            </button>
+          ))}
+        </div>
+      </SettingsField>
+      <SettingsField label={t("settings.statusBarItems")} hint={t("settings.statusBarItemsHint")} stacked>
+        <div className={`status-bar-items-editor${statusBarItemsExpanded ? " status-bar-items-editor--expanded" : ""}`}>
+          <div className="status-bar-items-editor__summary">
+            <span className="status-bar-items-editor__summary-text">
+              {t("settings.statusBarItemsSummary", { visible: statusBarItems.length, total: DEFAULT_STATUS_BAR_ITEMS.length })}
+            </span>
+            <Tooltip label={t(statusBarItemsExpanded ? "settings.statusBarItemsCollapse" : "settings.statusBarItemsExpand")}>
+              <button
+                type="button"
+                className="status-bar-items-editor__toggle"
+                aria-expanded={statusBarItemsExpanded}
+                aria-controls={statusBarItemsPanelId}
+                aria-label={t(statusBarItemsExpanded ? "settings.statusBarItemsCollapse" : "settings.statusBarItemsExpand")}
+                onClick={() => setStatusBarItemsExpanded((open) => !open)}
+              >
+                {statusBarItemsExpanded ? <ChevronUp size={15} aria-hidden="true" /> : <ChevronDown size={15} aria-hidden="true" />}
+              </button>
+            </Tooltip>
+          </div>
+          {statusBarItemsExpanded && (
+            <div className="status-bar-items-editor__list" id={statusBarItemsPanelId}>
+              {orderedStatusItems.map((id) => {
+                const label = statusBarItemLabel(id, t);
+                const visible = visibleStatusItems.has(id);
+                const visibleIndex = statusBarItems.indexOf(id);
+                const disableHide = visible && statusBarItems.length <= 1;
+                const dragLabel = t("settings.statusBarItem.drag", { label });
+                const moveUpLabel = t("settings.statusBarItem.moveUp", { label });
+                const moveDownLabel = t("settings.statusBarItem.moveDown", { label });
+                const dropPlacement = statusBarDragTarget?.id === id ? statusBarDragTarget.placement : null;
+                return (
+                  <div
+                    className={[
+                      "status-bar-item-row",
+                      visible ? "" : "status-bar-item-row--hidden",
+                      draggingStatusBarItem === id ? "status-bar-item-row--dragging" : "",
+                      dropPlacement ? "status-bar-item-row--drag-over" : "",
+                      dropPlacement === "before" ? "status-bar-item-row--drop-before" : "",
+                      dropPlacement === "after" ? "status-bar-item-row--drop-after" : "",
+                    ].filter(Boolean).join(" ")}
+                    data-statusbar-setting-item={id}
+                    key={id}
+                  >
+                    <Tooltip label={dragLabel}>
+                      <button
+                        type="button"
+                        className="status-bar-item-row__drag"
+                        disabled={!visible || busy}
+                        aria-label={dragLabel}
+                        title={dragLabel}
+                        onPointerDown={(event) => startStatusBarPointerDrag(event, id, visible)}
+                        onPointerMove={moveStatusBarPointerDrag}
+                        onPointerUp={endStatusBarPointerDrag}
+                        onPointerCancel={cancelStatusBarPointerDrag}
+                        onMouseDown={(event) => startStatusBarMouseDrag(event, id, visible)}
+                      >
+                        <GripVertical size={14} aria-hidden="true" />
+                      </button>
+                    </Tooltip>
+                    <label className="status-bar-item-row__toggle">
+                      <input
+                        type="checkbox"
+                        checked={visible}
+                        disabled={busy || disableHide}
+                        onChange={() => toggleStatusBarItem(id)}
+                      />
+                      <span className="status-bar-item-row__check" aria-hidden="true">
+                        {visible && <Check size={12} />}
+                      </span>
+                      <span className="status-bar-item-row__label">{label}</span>
+                    </label>
+                    <div className="status-bar-item-row__actions">
+                      <Tooltip label={moveUpLabel}>
+                        <button
+                          type="button"
+                          className="status-bar-item-row__order"
+                          disabled={busy || !visible || visibleIndex <= 0}
+                          onClick={() => moveStatusBarItem(id, -1)}
+                          aria-label={moveUpLabel}
+                        >
+                          <ChevronUp size={14} aria-hidden="true" />
+                        </button>
+                      </Tooltip>
+                      <Tooltip label={moveDownLabel}>
+                        <button
+                          type="button"
+                          className="status-bar-item-row__order"
+                          disabled={busy || !visible || visibleIndex < 0 || visibleIndex >= statusBarItems.length - 1}
+                          onClick={() => moveStatusBarItem(id, 1)}
+                          aria-label={moveDownLabel}
+                        >
+                          <ChevronDown size={14} aria-hidden="true" />
+                        </button>
+                      </Tooltip>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </SettingsField>
     </SettingsSection>
@@ -3199,15 +3546,333 @@ function ruleListHint(list: string, t: ReturnType<typeof useT>): string {
   }
 }
 
+type HookScope = "global" | "project";
+
+function HooksSection({ onChanged }: { onChanged: () => void }) {
+  const t = useT();
+  const [scope, setScope] = useState<HookScope>("global");
+  const [view, setView] = useState<HooksSettingsView | null>(null);
+  const [jsonText, setJsonText] = useState("");
+  const [jsonMessage, setJsonMessage] = useState<string | null>(null);
+  const [jsonError, setJsonError] = useState<string | null>(null);
+  const [pathMessage, setPathMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async (nextScope: HookScope) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const next = normalizeHooksSettingsView(await app.HooksSettings(nextScope), nextScope);
+      setView(next);
+      setJsonText(formatHooksJSON(next.hooks, next.events));
+      setJsonMessage(null);
+      setJsonError(null);
+      setPathMessage(null);
+    } catch (e) {
+      setErr(String((e as Error)?.message ?? e));
+      setView(null);
+      setJsonText("");
+      setJsonMessage(null);
+      setJsonError(null);
+      setPathMessage(null);
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load(scope);
+  }, [load, scope]);
+
+  const parseHooksEditorJSON = (raw = jsonText): { hooks: HookConfigView[]; text: string } | null => {
+    try {
+      const hooks = parseHooksJSON(raw, view?.events ?? []);
+      const text = formatHooksJSON(hooks, view?.events ?? []);
+      setJsonText(text);
+      setJsonError(null);
+      return { hooks, text };
+    } catch (e) {
+      setJsonError(t("settings.hooksJsonInvalid", { error: String((e as Error)?.message ?? e) }));
+      setJsonMessage(null);
+      return null;
+    }
+  };
+  const copyHooksJSON = async () => {
+    const parsed = parseHooksEditorJSON();
+    if (!parsed) return;
+    try {
+      await navigator.clipboard?.writeText(parsed.text);
+      setJsonMessage(t("settings.hooksJsonCopied"));
+    } catch {
+      setJsonMessage(t("settings.hooksJsonClipboardUnavailable"));
+    }
+  };
+  const formatHooksEditorJSON = (raw = jsonText) => {
+    const parsed = parseHooksEditorJSON(raw);
+    if (parsed) setJsonMessage(t("settings.hooksJsonFormatted"));
+  };
+  const pasteHooksJSON = async () => {
+    try {
+      const raw = await navigator.clipboard?.readText();
+      if (!raw) throw new Error(t("settings.hooksJsonClipboardEmpty"));
+      setJsonText(raw);
+      formatHooksEditorJSON(raw);
+    } catch (e) {
+      setJsonError(t("settings.hooksJsonPasteFailed", { error: String((e as Error)?.message ?? e) }));
+      setJsonMessage(null);
+    }
+  };
+  const copyHooksPath = async () => {
+    const path = view?.path?.trim();
+    if (!path) {
+      setPathMessage(t("settings.hooksPathUnavailable"));
+      return;
+    }
+    try {
+      await navigator.clipboard?.writeText(path);
+      setPathMessage(t("settings.hooksPathCopied"));
+    } catch {
+      setPathMessage(t("settings.hooksJsonClipboardUnavailable"));
+    }
+  };
+  const save = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const parsed = parseHooksEditorJSON();
+      if (!parsed) return;
+      await app.SaveHooksSettingsForRoot(scope, view?.projectRoot?.trim() ?? "", parsed.hooks);
+      await load(scope);
+      onChanged();
+    } catch (e) {
+      setErr(String((e as Error)?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const trustProject = async () => {
+    const projectRoot = view?.projectRoot?.trim() ?? "";
+    if (!projectRoot) {
+      setErr(t("settings.hooksProjectRootUnavailable"));
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await app.TrustProjectHooksForRoot(projectRoot);
+      await load("project");
+      onChanged();
+    } catch (e) {
+      setErr(String((e as Error)?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      {err && <div className="banner banner--error">{err}</div>}
+      <SettingsSection title={t("settings.hooksScopeSection")} description={t("settings.hooksScopeHint")}>
+        <SettingsField label={t("settings.hooksScopeField")}>
+          <select className="mem-select set-grow" value={scope} disabled={busy} onChange={(e) => setScope(e.target.value === "project" ? "project" : "global")}>
+            <option value="global">{t("settings.hooksGlobal")}</option>
+            <option value="project">{t("settings.hooksProject")}</option>
+          </select>
+        </SettingsField>
+        <SettingsField label={t("settings.hooksPath")} hint={scope === "project" ? t("settings.hooksPathProjectHint") : t("settings.hooksPathGlobalHint")}>
+          <div className="hooks-path-stack">
+            <div className={`hooks-path-display${view?.path ? "" : " hooks-path-display--empty"}`}>
+              <code className="hooks-path-display__value" title={view?.path || t("settings.hooksPathUnavailable")}>
+                {view?.path || t("settings.hooksPathUnavailable")}
+              </code>
+              <button className="btn btn--small" disabled={busy || !view?.path} onClick={() => void copyHooksPath()}>{t("settings.hooksPathCopy")}</button>
+            </div>
+            {pathMessage && <div className="hooks-path-display__message">{pathMessage}</div>}
+          </div>
+        </SettingsField>
+        {scope === "project" && (
+          <SettingsField label={t("settings.hooksTrust")} hint={t("settings.hooksTrustHint")}>
+            <div className="hooks-trust-stack">
+              <div className="hooks-trust-row">
+                <span className={`set-rule${view?.trusted ? "" : " set-rule--warn"}`}>{view?.trusted ? t("settings.hooksTrusted") : t("settings.hooksUntrusted")}</span>
+                <button className="btn btn--small" disabled={busy || view?.trusted || !view?.projectRoot} onClick={() => void trustProject()}>{t("settings.hooksTrustProject")}</button>
+              </div>
+              <code className={`hooks-trust-root${view?.projectRoot ? "" : " hooks-trust-root--empty"}`} title={view?.projectRoot || t("settings.hooksProjectRootUnavailable")}>
+                {view?.projectRoot || t("settings.hooksProjectRootUnavailable")}
+              </code>
+            </div>
+          </SettingsField>
+        )}
+      </SettingsSection>
+
+      <SettingsSection
+        title={t("settings.hooks")}
+        description={scope === "project" ? t("settings.hooksProjectHint") : t("settings.hooksGlobalHint")}
+        actions={(
+          <button className="btn btn--small btn--primary" disabled={busy} onClick={() => void save()}>{t("common.save")}</button>
+        )}
+      >
+        {view && (
+          <div className="hooks-json-panel">
+            <div className="hooks-json-panel__head">
+              <div>
+                <div className="set-rules__label">{t("settings.hooksJsonTitle")}</div>
+                <div className="set-rules__hint">{t("settings.hooksJsonHint")}</div>
+              </div>
+              <div className="hooks-json-panel__actions">
+                <button className="btn btn--small" disabled={busy} onClick={() => void copyHooksJSON()}>{t("settings.hooksJsonCopy")}</button>
+                <button className="btn btn--small" disabled={busy} onClick={() => void pasteHooksJSON()}>{t("settings.hooksJsonPaste")}</button>
+                <button className="btn btn--small" disabled={busy || !jsonText.trim()} onClick={() => formatHooksEditorJSON()}>{t("settings.hooksJsonApply")}</button>
+              </div>
+            </div>
+            <textarea
+              className="mem-textarea hooks-json-panel__textarea"
+              value={jsonText}
+              disabled={busy}
+              spellCheck={false}
+              onChange={(e) => {
+                setJsonText(e.target.value);
+                setJsonMessage(null);
+                setJsonError(null);
+              }}
+            />
+            {jsonError && <div className="hooks-json-panel__message hooks-json-panel__message--error">{jsonError}</div>}
+            {jsonMessage && <div className="hooks-json-panel__message">{jsonMessage}</div>}
+          </div>
+        )}
+        {!view && <div className="empty">{t("settings.loading")}</div>}
+      </SettingsSection>
+    </>
+  );
+}
+
+function normalizeHooksSettingsView(view: HooksSettingsView, scope: HookScope): HooksSettingsView {
+  const events = asArray(view?.events).filter(Boolean);
+  return {
+    scope: view?.scope === "project" ? "project" : scope,
+    path: view?.path ?? "",
+    projectRoot: view?.projectRoot ?? "",
+    trusted: !!view?.trusted,
+    events,
+    hooks: asArray(view?.hooks).map(normalizeHookConfig).filter((h) => h.event),
+  };
+}
+
+function formatHooksJSON(hooks: HookConfigView[], eventOrder: string[]): string {
+  const grouped: Record<string, Array<Record<string, string | number>>> = {};
+  const events = new Set(eventOrder);
+  for (const hook of hooks.map(normalizeHookConfig).filter((h) => h.event)) {
+    events.add(hook.event);
+    const entry: Record<string, string | number> = { command: hook.command };
+    if (hook.match) entry.match = hook.match;
+    if (hook.description) entry.description = hook.description;
+    if ((hook.timeout ?? 0) > 0) entry.timeout = hook.timeout ?? 0;
+    if (hook.cwd) entry.cwd = hook.cwd;
+    (grouped[hook.event] ||= []).push(entry);
+  }
+  const ordered: typeof grouped = {};
+  for (const event of [...eventOrder, ...Array.from(events).sort()]) {
+    if (grouped[event]?.length && !ordered[event]) ordered[event] = grouped[event];
+  }
+  return JSON.stringify({ hooks: ordered }, null, 2);
+}
+
+function parseHooksJSON(raw: string, validEvents: string[]): HookConfigView[] {
+  const trimmed = raw.trim();
+  if (!trimmed) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (e) {
+    throw new Error(String((e as Error)?.message ?? e));
+  }
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => normalizeHookConfig(parseHookArrayItem(item, validEvents))).filter((h) => h.event);
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("expected an object or array");
+  }
+  const obj = parsed as Record<string, unknown>;
+  const hooksValue = obj.hooks && typeof obj.hooks === "object" && !Array.isArray(obj.hooks) ? obj.hooks : obj;
+  return flattenHooksMap(hooksValue as Record<string, unknown>, validEvents);
+}
+
+function parseHookArrayItem(item: unknown, validEvents: string[]): HookConfigView {
+  if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error("hook item must be an object");
+  const obj = item as Record<string, unknown>;
+  const event = stringField(obj, "event") || "PreToolUse";
+  if (validEvents.length > 0 && !validEvents.includes(event)) throw new Error(`unknown hook event ${event}`);
+  return {
+    event,
+    match: stringField(obj, "match"),
+    command: stringField(obj, "command"),
+    description: stringField(obj, "description"),
+    timeout: numberField(obj, "timeout"),
+    cwd: stringField(obj, "cwd"),
+  };
+}
+
+function flattenHooksMap(hooks: Record<string, unknown>, validEvents: string[]): HookConfigView[] {
+  const valid = new Set(validEvents);
+  const out: HookConfigView[] = [];
+  for (const [event, value] of Object.entries(hooks)) {
+    if (valid.size > 0 && !valid.has(event)) throw new Error(`unknown hook event ${event}`);
+    const items = Array.isArray(value) ? value : [value];
+    for (const item of items) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`hook ${event} item must be an object`);
+      const obj = item as Record<string, unknown>;
+      out.push(normalizeHookConfig({
+        event,
+        match: stringField(obj, "match"),
+        command: stringField(obj, "command"),
+        description: stringField(obj, "description"),
+        timeout: numberField(obj, "timeout"),
+        cwd: stringField(obj, "cwd"),
+      }));
+    }
+  }
+  return out.filter((h) => h.event);
+}
+
+function stringField(obj: Record<string, unknown>, key: string): string {
+  const value = obj[key];
+  return typeof value === "string" ? value : "";
+}
+
+function numberField(obj: Record<string, unknown>, key: string): number {
+  const value = obj[key];
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : 0;
+}
+
+function normalizeHookConfig(h: HookConfigView): HookConfigView {
+  return {
+    event: h.event || "PreToolUse",
+    match: h.match ?? "",
+    command: h.command ?? "",
+    description: h.description ?? "",
+    timeout: h.timeout && h.timeout > 0 ? Math.floor(h.timeout) : 0,
+    cwd: h.cwd ?? "",
+  };
+}
+
 function SandboxSection({ s, busy, apply }: SectionProps) {
   const t = useT();
   const sb = s.sandbox;
   const [root, setRoot] = useState(sb.workspaceRoot);
   const set = (next: Partial<typeof sb>) =>
-    apply(() => app.SetSandbox(next.bash ?? sb.bash, next.network ?? sb.network, next.workspaceRoot ?? sb.workspaceRoot, next.allowWrite ?? sb.allowWrite));
+    apply(() => app.SetSandbox(next.bash ?? sb.bash, next.network ?? sb.network, next.workspaceRoot ?? sb.workspaceRoot, next.allowWrite ?? sb.allowWrite, next.shell ?? sb.shell));
 
   return (
     <SettingsSection title={t("settings.sandboxTitle")}>
+      <SettingsField label={t("settings.shellInterpreter")}>
+        <select className="mem-select set-grow" value={sb.shell || "auto"} disabled={busy} onChange={(e) => void set({ shell: e.target.value })}>
+          <option value="auto">{t("settings.shellAuto")}</option>
+          <option value="bash">{t("settings.shellBash")}</option>
+          <option value="powershell">{t("settings.shellPowershell")}</option>
+          <option value="pwsh">{t("settings.shellPwsh")}</option>
+        </select>
+      </SettingsField>
       <SettingsField label={t("settings.bashSandbox")}>
         <select className="mem-select set-grow" value={sb.bash} disabled={busy} onChange={(e) => void set({ bash: e.target.value })}>
           <option value="enforce">{t("settings.bashEnforce")}</option>
