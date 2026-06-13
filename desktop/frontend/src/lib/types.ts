@@ -567,6 +567,7 @@ export interface MemoryView {
   archives: MemoryArchive[];
   scopes: MemoryScope[];
   storeDir: string;
+  storeGlobalDir?: string;
   available: boolean;
 }
 
@@ -645,6 +646,7 @@ export interface AgentView {
   maxSteps: number;
   plannerMaxSteps: number;
   systemPrompt: string;
+  coldResumePrune: boolean;
 }
 
 export interface BotAllowlistView {
