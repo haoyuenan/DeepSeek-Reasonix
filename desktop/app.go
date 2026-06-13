@@ -372,7 +372,7 @@ func (a *App) restoreOrBuildTabs() {
 	// Run legacy config migration before the first config load so the
 	// freshly written config (including the user's default_model) is
 	// picked up by Load instead of falling back to built-in defaults.
-	config.MigrateLegacyIfNeeded()
+	_, _ = config.MigrateLegacyIfNeeded()
 
 	// Load i18n from the first available config.
 	// Prefer DesktopLanguage (desktop UI setting) over Language (CLI setting),
@@ -928,12 +928,23 @@ func (a *App) CheckpointsForTab(tabID string) []CheckpointMeta {
 	// RestoreCode(turn) reverts every file touched in this turn or any later one, so
 	// a turn can rewind code even when it changed no files itself — as long as a
 	// later turn did. Propagate CanCode backwards over the oldest-first list.
+	// Also propagate the cumulative unique file count so the UI shows how many
+	// files RestoreCode would actually affect from this turn.
 	hasCodeAfter := false
+	codeFileSet := make(map[string]bool, len(metas)*2)
 	for i := len(out) - 1; i >= 0; i-- {
 		if len(out[i].Files) > 0 {
 			hasCodeAfter = true
 		}
+		for _, f := range out[i].Files {
+			codeFileSet[f] = true
+		}
 		out[i].CanCode = hasCodeAfter
+		out[i].Files = make([]string, 0, len(codeFileSet))
+		for f := range codeFileSet {
+			out[i].Files = append(out[i].Files, f)
+		}
+		sort.Strings(out[i].Files) // map iteration is unordered; keep the list stable
 	}
 	return out
 }
@@ -1984,14 +1995,6 @@ func (a *App) SetAutoApproveTools(on bool) {
 		return
 	}
 	a.SetToolApprovalModeForTab("", control.ToolApprovalAsk)
-}
-
-func (a *App) setAutoApproveToolsForTab(tabID string, on bool) {
-	if on {
-		a.SetToolApprovalModeForTab(tabID, control.ToolApprovalYolo)
-		return
-	}
-	a.SetToolApprovalModeForTab(tabID, control.ToolApprovalAsk)
 }
 
 // SetBypass is the legacy Wails binding for SetAutoApproveTools.
@@ -3832,14 +3835,6 @@ func (a *App) workspacePath(rel string) (string, bool, error) {
 	return workspacePathForBase(base, rel)
 }
 
-func workspacePath(rel string) (string, bool, error) {
-	base, err := os.Getwd()
-	if err != nil {
-		return "", false, err
-	}
-	return workspacePathForBase(base, rel)
-}
-
 func workspacePathForBase(base, rel string) (string, bool, error) {
 	base = filepath.Clean(base)
 	if rel == "" {
@@ -4057,19 +4052,11 @@ func revealPath(path string) error {
 	}
 }
 
-func (a *App) notice(text string) {
-	a.noticeForTab("", text)
-}
-
 func (a *App) noticeForTab(tabID, text string) {
 	tab := a.tabByID(tabID)
 	if tab != nil && tab.sink != nil {
 		tab.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: text})
 	}
-}
-
-func (a *App) runEffortCommand(input string) {
-	a.runEffortCommandForTab("", input)
 }
 
 func (a *App) runEffortCommandForTab(tabID, input string) {
@@ -4106,10 +4093,6 @@ func (a *App) runEffortCommandForTab(tabID, input string) {
 		display = "auto"
 	}
 	a.noticeForTab(tabID, fmt.Sprintf("effort for %s set to %s", entry.Name, display))
-}
-
-func (a *App) currentProviderEntry() (*config.ProviderEntry, error) {
-	return a.currentProviderEntryForTab("")
 }
 
 func (a *App) currentProviderEntryForTab(tabID string) (*config.ProviderEntry, error) {
