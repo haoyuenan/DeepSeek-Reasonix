@@ -15,6 +15,7 @@ import (
 	"reasonix/internal/agent"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
+	"reasonix/internal/jobs"
 	"reasonix/internal/provider"
 )
 
@@ -111,6 +112,28 @@ func TestServeEndpoints(t *testing.T) {
 
 	if resp, _ := http.Post(srv.URL+"/submit", "application/json", strings.NewReader(`{}`)); resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("empty submit should be 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestServeSubmitRejectsShellShortcut(t *testing.T) {
+	bc := NewBroadcaster()
+	got := make(chan string, 1)
+	ctrl := control.New(control.Options{Runner: fakeRunner{got: got}, Sink: bc})
+	srv := httptest.NewServer(New(ctrl, bc).Handler())
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/submit", "application/json", strings.NewReader(`{"input":"!echo nope"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("shell submit status = %d, want 403", resp.StatusCode)
+	}
+	select {
+	case in := <-got:
+		t.Fatalf("runner should not run shell submit, got %q", in)
+	default:
 	}
 }
 
@@ -312,6 +335,50 @@ func TestServeIndexPagePassesLanguagePreferenceToClient(t *testing.T) {
 	}
 }
 
+func TestResumeRequiresSessionPathInsideSessionDir(t *testing.T) {
+	dir := t.TempDir()
+	active := filepath.Join(dir, "active.jsonl")
+	inside := filepath.Join(dir, "inside.jsonl")
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "outside.jsonl")
+	for _, path := range []string{active, inside, outside} {
+		if err := os.WriteFile(path, []byte(`{"role":"user","content":"hi"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bc := NewBroadcaster()
+	ctrl := control.New(control.Options{Sink: bc, SessionDir: dir, SessionPath: active})
+	srv := httptest.NewServer(New(ctrl, bc).Handler())
+	defer srv.Close()
+
+	post := func(path string) int {
+		body, err := json.Marshal(map[string]string{"path": path})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := http.Post(srv.URL+"/resume", "application/json", strings.NewReader(string(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if got := post(outside); got != http.StatusForbidden {
+		t.Fatalf("outside resume status = %d, want 403", got)
+	}
+	if got := post(inside); got != http.StatusNoContent {
+		t.Fatalf("inside resume status = %d, want 204", got)
+	}
+	want, err := filepath.EvalSymlinks(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Clean(ctrl.SessionPath()); got != filepath.Clean(want) {
+		t.Fatalf("session path = %q, want %q", got, want)
+	}
+}
+
 func TestDeleteSessionRequiresSessionNameInsideSessionDir(t *testing.T) {
 	dir := t.TempDir()
 	active := filepath.Join(dir, "active.jsonl")
@@ -323,6 +390,13 @@ func TestDeleteSessionRequiresSessionNameInsideSessionDir(t *testing.T) {
 	}
 	ref := "sa_20260102_030405_000000000_aabbccddeeff"
 	writeServeSubagentArtifact(t, dir, ref, agent.BranchID(old))
+	oldJobsDir := jobs.ArtifactDir(old)
+	if err := os.MkdirAll(oldJobsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldJobsDir, "bash-1.log"), []byte("output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	sibling := dir + "-other"
 	if err := os.MkdirAll(sibling, 0o755); err != nil {
 		t.Fatal(err)
@@ -368,6 +442,9 @@ func TestDeleteSessionRequiresSessionNameInsideSessionDir(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "subagents", ref+".meta.json")); !os.IsNotExist(err) {
 		t.Fatalf("old session subagent meta still exists or stat failed unexpectedly: %v", err)
+	}
+	if _, err := os.Stat(oldJobsDir); !os.IsNotExist(err) {
+		t.Fatalf("old session jobs sidecar still exists or stat failed unexpectedly: %v", err)
 	}
 }
 
