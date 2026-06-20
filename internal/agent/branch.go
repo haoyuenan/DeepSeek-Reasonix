@@ -28,7 +28,30 @@ type BranchMeta struct {
 	TopicID          string    `json:"topic_id,omitempty"`
 	TopicTitle       string    `json:"topic_title,omitempty"`
 	Model            string    `json:"model,omitempty"`
+	// SchemaVersion records the BranchMeta version that last wrote the listing
+	// fields (Turns/Preview) FROM the session's content. It is stamped only by the
+	// writers that actually derive those counts — Controller.snapshot's
+	// UpdateSessionMeta and Fork/Branch — never by EnsureBranchMeta / TouchBranchMeta
+	// / rename / set-model, which don't know the turn count. So ListSessions can
+	// tell a meta whose counts are authoritative (>= BranchMetaCountsVersion: trust
+	// Turns even when 0 = genuinely empty) from a legacy/contentless one
+	// (< version: decode once, then backfill + stamp).
+	SchemaVersion int `json:"schema_version,omitempty"`
+	// Turns and Preview are listing-only fields the desktop sidebar and CLI
+	// pickers show ("5 turns · 'help me debug…'") without decoding the whole
+	// .jsonl. The autosave path (Controller.snapshot) keeps them fresh from the
+	// in-memory conversation, so ListSessions stays O(1) per session instead of
+	// O(file size). Gated by SchemaVersion (above), not Turns == 0, so a
+	// genuinely-empty session is recorded once and never re-decoded.
+	Turns   int    `json:"turns,omitempty"`
+	Preview string `json:"preview,omitempty"`
 }
+
+// BranchMetaCountsVersion is stamped into BranchMeta.SchemaVersion whenever a
+// writer records Turns/Preview from session content (UpdateSessionMeta,
+// Fork/Branch). Bump it when the meaning of those listing fields changes so
+// existing listings re-derive them instead of trusting a stale cache.
+const BranchMetaCountsVersion = 1
 
 func (m BranchMeta) DefaultScope() string {
 	switch m.Scope {
@@ -266,4 +289,28 @@ func SetBranchModelPreserveUpdated(sessionPath, model string) error {
 	}
 	meta.Model = strings.TrimSpace(model)
 	return SaveBranchMetaPreserveUpdated(sessionPath, meta)
+}
+
+// UpdateSessionMeta refreshes the listing-only sidecar fields (model, preview,
+// user-turn count) the sidebar and pickers read without decoding the .jsonl.
+// markActivity bumps UpdatedAt (the autosave path passes true on a real turn);
+// false preserves it (used to backfill legacy sessions during a read). An empty
+// model leaves the stored model untouched.
+func UpdateSessionMeta(sessionPath, model, preview string, turns int, markActivity bool) error {
+	if sessionPath == "" {
+		return fmt.Errorf("empty session path")
+	}
+	m, err := EnsureBranchMeta(sessionPath)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(model) != "" {
+		m.Model = strings.TrimSpace(model)
+	}
+	m.Preview = preview
+	m.Turns = turns
+	// These counts were derived from the current content, so mark them
+	// authoritative — listing can then trust Turns (even 0) without re-decoding.
+	m.SchemaVersion = BranchMetaCountsVersion
+	return saveBranchMeta(sessionPath, m, markActivity)
 }

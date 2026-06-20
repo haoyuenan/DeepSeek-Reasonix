@@ -144,63 +144,12 @@ func TestSessionListCacheRefillsAfterInvalidate(t *testing.T) {
 	}
 }
 
-func TestSessionDiskCachePersistsDirectorySignatures(t *testing.T) {
-	cachePath := filepath.Join(t.TempDir(), "project-session-cache.json")
-	dir := t.TempDir()
-	sessionPath := filepath.Join(dir, "one.jsonl")
-	signature := []topicSessionFileSignature{{
-		Name:    "one.jsonl",
-		Size:    42,
-		ModTime: time.Now().UnixNano(),
-	}}
-	session := agent.SessionInfo{
-		Path:           sessionPath,
-		CreatedAt:      time.Now().Add(-time.Minute),
-		LastActivityAt: time.Now(),
-		Preview:        "hello",
-		Turns:          1,
-		Scope:          "project",
-		WorkspaceRoot:  dir,
-		TopicID:        "topic-cache",
-		TopicTitle:     "Cache",
-	}
-
-	writer := &sessionDiskCache{path: cachePath}
-	if err := writer.putDir(dir, signature, []agent.SessionInfo{session}, map[string]string{"one.jsonl": "One"}); err != nil {
-		t.Fatalf("putDir: %v", err)
-	}
-	raw, err := os.ReadFile(cachePath)
-	if err != nil {
-		t.Fatalf("read cache: %v", err)
-	}
-	if text := string(raw); !strings.Contains(text, `"name": "one.jsonl"`) {
-		t.Fatalf("signature was not persisted with exported fields: %s", text)
-	}
-
-	reader := &sessionDiskCache{path: cachePath}
-	entry, ok := reader.getDir(dir, signature)
-	if !ok {
-		t.Fatalf("expected disk cache hit after reload")
-	}
-	if len(entry.Sessions) != 1 || entry.Sessions[0].Path != sessionPath || entry.Titles["one.jsonl"] != "One" {
-		t.Fatalf("disk cache entry = %+v", entry)
-	}
-	changed := append([]topicSessionFileSignature(nil), signature...)
-	changed[0].Size++
-	if _, ok := reader.getDir(dir, changed); ok {
-		t.Fatalf("disk cache hit with changed signature")
-	}
-}
-
 func TestRenameSessionInvalidatesProjectTreeCache(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	oldProjectCache := projectSessionCache
-	oldDiskCache := sessionDiskCacher
 	projectSessionCache = &sessionListCache{byDir: map[string]sessionListCacheEntry{}}
-	sessionDiskCacher = &sessionDiskCache{path: filepath.Join(t.TempDir(), "project-session-cache.json")}
 	t.Cleanup(func() {
 		projectSessionCache = oldProjectCache
-		sessionDiskCacher = oldDiskCache
 	})
 
 	dir := t.TempDir()
@@ -464,6 +413,54 @@ func TestLegacySessionsMigrateIntoGlobalTopics(t *testing.T) {
 	nodes = NewApp().ListProjectTree()
 	if got := len(nodes[0].Children); got != 2 {
 		t.Fatalf("migration should be idempotent, global topics = %d", got)
+	}
+}
+
+func TestTopicMigrationMarkerGatesRescan(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	writeLegacySession(t, dir, "first.jsonl", "first legacy prompt", time.Now().Add(-time.Hour))
+
+	// First render migrates the legacy session and, with nothing deferred, stamps
+	// the one-shot marker so later renders can skip the scan.
+	NewApp().ListProjectTree()
+	if _, err := os.Stat(filepath.Join(dir, topicMigrationMarker)); err != nil {
+		t.Fatalf("expected migration marker after a complete pass: %v", err)
+	}
+
+	// A legacy session added after the marker is left un-migrated: the gate skips
+	// the per-render scan entirely (real new sessions are born with a TopicID, so
+	// no fresh legacy files actually appear after the pass).
+	second := writeLegacySession(t, dir, "second.jsonl", "second legacy prompt", time.Now())
+	NewApp().ListProjectTree()
+	meta, ok, err := agent.LoadBranchMeta(second)
+	if err != nil {
+		t.Fatalf("load second meta: %v", err)
+	}
+	if ok && strings.TrimSpace(meta.TopicID) != "" {
+		t.Fatalf("marker should have gated re-scan, but second session was migrated: %+v", meta)
+	}
+}
+
+func TestTopicMigrationDefersEmptyLegacySession(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	dir := config.SessionDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	// An empty legacy session (no user turns) is not migratable yet but could gain
+	// content later, so the pass must NOT mark the dir done — otherwise the gate
+	// would hide it forever.
+	if err := os.WriteFile(filepath.Join(dir, "empty.jsonl"), nil, 0o644); err != nil {
+		t.Fatalf("write empty session: %v", err)
+	}
+
+	NewApp().ListProjectTree()
+	if _, err := os.Stat(filepath.Join(dir, topicMigrationMarker)); err == nil {
+		t.Fatal("an empty legacy session must defer marking, but the dir was marked done")
 	}
 }
 
