@@ -1,6 +1,8 @@
 # Reasonix configuration.
-# Resolution order: flag > ./reasonix.toml > ~/.config/reasonix/config.toml > built-in defaults.
-# Secrets come from the environment via api_key_env; never put keys here.
+# Resolution order: flag > ./reasonix.toml > ~/.reasonix/config.toml > built-in defaults.
+# Fields marked user/global only are not overridden by ./reasonix.toml.
+# Provider entries name secrets via api_key_env; saved key values live in
+# Reasonix's global ~/.reasonix/.env. Never put API key values here.
 
 default_model = "deepseek"   # a provider name (→ its default model) or "provider/model"
 # language      = "zh"   # ui language; empty = auto-detect from $LANG / $REASONIX_LANG
@@ -28,10 +30,11 @@ Use the provided tools to read and write files and run shell commands.
 Principles: understand the request before acting; verify with tools instead of
 guessing; keep changes minimal and correct; briefly summarize what you did."""
 # system_prompt_file = "prompts/system.md"   # overrides system_prompt when set
-max_steps         = 0    # executor tool-call rounds; 0 = no limit
-planner_max_steps = 12   # planner read-only tool-call rounds; 0 = no limit
+max_steps         = 0    # user/global only; executor tool-call rounds; 0 = no limit
+planner_max_steps = 0    # user/global only; planner read-only tool-call rounds; 0 = no limit
 temperature       = 0.0
-auto_plan         = "off"   # off|on; off keeps plan mode manual
+auto_plan         = "off"   # user-level only; ignored in project reasonix.toml
+memory_compiler = { enabled = true }   # user-level only; Memory v5 execution compiler
 # reasoning_language = "auto"   # visible reasoning text: auto|zh|en
 # auto_plan_classifier = "deepseek-flash"   # optional; only used for borderline tasks
 soft_compact_ratio  = 0.5   # notice only; keeps the cache-first prefix intact
@@ -135,6 +138,9 @@ stalled_warning_seconds = 900   # warn once per background job after this many q
 # [[plugins]]
 # name    = "example"
 # command = "reasonix-plugin-example"
+# # Raw MCP tool names that Reasonix may trust as read-only for planner / plan mode.
+# # Use for audited third-party readers whose readOnlyHint is otherwise untrusted.
+# # trusted_read_only_tools = ["search"]
 # # Enabled MCP servers connect automatically in the background after session
 # # start. Use /mcp or the desktop MCP panel to refresh, reconnect, or disable.
 
@@ -177,3 +183,10 @@ stalled_warning_seconds = 900   # warn once per background job after this many q
 # account_id = "default"
 # token_env = "WEIXIN_BOT_TOKEN"
 # api_base  = "https://ilinkai.weixin.qq.com"   # Tencent iLink Bot API base URL
+
+[serve]
+# Authentication for the HTTP serve frontend (reasonix serve).
+# auth_mode = "none"      # none | token | password
+# token      = ""          # pre-shared token for auth_mode = "token" (auto-generated if empty)
+# password_hash = ""       # bcrypt hash for auth_mode = "password". Generate with: reasonix serve --hash-password <password>
+# behind_proxy = false      # set true when behind a trusted reverse proxy (nginx, Caddy, etc.) that sets X-Forwarded-* headers

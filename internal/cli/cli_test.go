@@ -138,6 +138,32 @@ func TestServeResumeRejectsCleanupPending(t *testing.T) {
 	}
 }
 
+func TestServeRejectsUnknownAuthMode(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	errOut := captureStderr(t, func() {
+		if rc := runServe([]string{"--auth", "tokne", "--addr", "127.0.0.1:0"}); rc != 1 {
+			t.Fatalf("serve --auth tokne rc = %d, want 1", rc)
+		}
+	})
+	if !strings.Contains(errOut, "auth mode must be none, token, or password") {
+		t.Fatalf("serve --auth tokne stderr = %q, want auth mode validation", errOut)
+	}
+}
+
+func TestServePasswordAuthRequiresPasswordMaterial(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	errOut := captureStderr(t, func() {
+		if rc := runServe([]string{"--auth", "password", "--addr", "127.0.0.1:0"}); rc != 1 {
+			t.Fatalf("serve --auth password without password rc = %d, want 1", rc)
+		}
+	})
+	if !strings.Contains(errOut, "auth mode password requires --password or serve.password_hash") {
+		t.Fatalf("serve --auth password stderr = %q, want password material validation", errOut)
+	}
+}
+
 func TestReserveNativeScrollbackFrameWritesOnlyNewlines(t *testing.T) {
 	var b bytes.Buffer
 	reserveNativeScrollbackFrame(&b, 3)
@@ -439,7 +465,7 @@ func TestConfigAutoPlanCommandWritesUserConfig(t *testing.T) {
 	}
 }
 
-func TestConfigAutoPlanLocalCreatesMinimalProjectOverride(t *testing.T) {
+func TestConfigAutoPlanLocalIsRejected(t *testing.T) {
 	isolateCLIConfigHome(t)
 
 	userCfg := config.Default()
@@ -448,24 +474,16 @@ func TestConfigAutoPlanLocalCreatesMinimalProjectOverride(t *testing.T) {
 		t.Fatalf("write user config: %v", err)
 	}
 
-	out := captureStdout(t, func() {
-		if rc := Run([]string{"config", "auto-plan", "--local", "on"}, "test-version"); rc != 0 {
-			t.Fatalf("config auto-plan --local rc = %d, want 0", rc)
+	errOut := captureStderr(t, func() {
+		if rc := Run([]string{"config", "auto-plan", "--local", "on"}, "test-version"); rc != 2 {
+			t.Fatalf("config auto-plan --local rc = %d, want 2", rc)
 		}
 	})
-	if !strings.Contains(out, `auto_plan = "on"`) {
-		t.Fatalf("config auto-plan --local output = %q", out)
+	if !strings.Contains(errOut, "--local is not supported") {
+		t.Fatalf("config auto-plan --local stderr = %q", errOut)
 	}
-
-	body, err := os.ReadFile("reasonix.toml")
-	if err != nil {
-		t.Fatalf("read project config: %v", err)
-	}
-	if strings.Contains(string(body), "default_model") {
-		t.Fatalf("project auto-plan override should not pin default_model:\n%s", body)
-	}
-	if !strings.Contains(string(body), "[agent]") || !strings.Contains(string(body), `auto_plan = "on"`) {
-		t.Fatalf("project config missing auto_plan override:\n%s", body)
+	if _, err := os.Stat("reasonix.toml"); !os.IsNotExist(err) {
+		t.Fatalf("reasonix.toml should not be written, stat err=%v", err)
 	}
 
 	cfg, err := config.Load()
@@ -475,8 +493,90 @@ func TestConfigAutoPlanLocalCreatesMinimalProjectOverride(t *testing.T) {
 	if cfg.DefaultModel != "mimo-pro" {
 		t.Fatalf("default_model = %q, want global mimo-pro", cfg.DefaultModel)
 	}
+	if cfg.Agent.AutoPlan != "off" {
+		t.Fatalf("auto_plan = %q, want global off", cfg.Agent.AutoPlan)
+	}
+}
+
+func TestConfigMemoryV5CommandWritesUserConfig(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	out := captureStdout(t, func() {
+		if rc := Run([]string{"config", "memory-v5", "off"}, "test-version"); rc != 0 {
+			t.Fatalf("config memory-v5 rc = %d, want 0", rc)
+		}
+	})
+	if !strings.Contains(out, "memory_compiler.enabled = false") {
+		t.Fatalf("config memory-v5 output = %q", out)
+	}
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if cfg.MemoryCompilerEnabled() {
+		t.Fatalf("saved memory_compiler.enabled = true, want false")
+	}
+
+	out = captureStdout(t, func() {
+		if rc := Run([]string{"config", "memory-v5", "status"}, "test-version"); rc != 0 {
+			t.Fatalf("config memory-v5 status rc = %d, want 0", rc)
+		}
+	})
+	if !strings.Contains(out, "memory_compiler.enabled = false") {
+		t.Fatalf("config memory-v5 status output = %q", out)
+	}
+}
+
+func TestConfigMemoryV5LocalIsRejected(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	errOut := captureStderr(t, func() {
+		if rc := Run([]string{"config", "memory-v5", "--local", "off"}, "test-version"); rc != 2 {
+			t.Fatalf("config memory-v5 --local rc = %d, want 2", rc)
+		}
+	})
+	if !strings.Contains(errOut, "--local is not supported") {
+		t.Fatalf("config memory-v5 --local stderr = %q", errOut)
+	}
+	if _, err := os.Stat("reasonix.toml"); !os.IsNotExist(err) {
+		t.Fatalf("reasonix.toml should not be written, stat err=%v", err)
+	}
+}
+
+func TestConfigAutoPlanIgnoresProjectConfig(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	userCfg := config.Default()
+	if err := userCfg.SetAutoPlan("off"); err != nil {
+		t.Fatal(err)
+	}
+	if err := userCfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+	if err := os.WriteFile("reasonix.toml", []byte("[agent]\nauto_plan = \"on\"\n"), 0o644); err != nil {
+		t.Fatalf("write project config: %v", err)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Agent.AutoPlan != "off" {
+		t.Fatalf("auto_plan = %q, want user-level off despite project on", cfg.Agent.AutoPlan)
+	}
+
+	if err := userCfg.SetAutoPlan("on"); err != nil {
+		t.Fatal(err)
+	}
+	if err := userCfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("rewrite user config: %v", err)
+	}
+	if err := os.WriteFile("reasonix.toml", []byte("[agent]\nauto_plan = \"off\"\n"), 0o644); err != nil {
+		t.Fatalf("rewrite project config: %v", err)
+	}
+	cfg, err = config.Load()
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
 	if cfg.Agent.AutoPlan != "on" {
-		t.Fatalf("auto_plan = %q, want local on", cfg.Agent.AutoPlan)
+		t.Fatalf("auto_plan = %q, want user-level on despite project off", cfg.Agent.AutoPlan)
 	}
 }
 
@@ -762,8 +862,8 @@ func TestConfigureKeysAllSetDefaultsToReusingInput(t *testing.T) {
 
 // TestAppendEnvUpsertReplacesExistingKey covers the bug where re-running the
 // wizard with a corrected key would append a second line for the same env
-// var. loadDotEnv is first-wins, so without dedupe the stale key kept
-// authenticating, and the user saw a 401 with no obvious cause.
+// var. Without dedupe, different dotenv readers can disagree on which
+// assignment wins, leaving stale keys hard to diagnose.
 func TestAppendEnvUpsertReplacesExistingKey(t *testing.T) {
 	t.Setenv("DEEPSEEK_API_KEY", "") // also covers the os.Setenv pin path
 	p := filepath.Join(t.TempDir(), ".env")

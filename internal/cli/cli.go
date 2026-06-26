@@ -402,13 +402,66 @@ func runServe(args []string) int {
 	maxSteps := fs.Int("max-steps", 0, "max tool-call rounds (0 = use config/default)")
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address")
 	resume := fs.String("resume", "", "resume a saved session file")
+	auth := fs.String("auth", "", "auth mode: none, token, or password (default: none)")
+	token := fs.String("token", "", "pre-shared token for auth=token (auto-generated if empty)")
+	password := fs.String("password", "", "password for auth=password (use --hash-password to store a hash instead)")
+	hashPassword := fs.Bool("hash-password", false, "print a bcrypt hash of --password and exit")
+	behindProxy := fs.Bool("behind-proxy", false, "trust X-Forwarded-For / X-Forwarded-Proto headers from a reverse proxy")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	// --hash-password: generate a bcrypt hash and exit.
+	if *hashPassword {
+		if *password == "" {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "--hash-password requires --password")
+			return 1
+		}
+		h, err := serve.HashPassword(*password)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		fmt.Println(h)
+		return 0
 	}
 
 	ctx := context.Background()
 	bc := serve.NewBroadcaster()
 	cfg, _ := config.Load()
+
+	// Build serve config, merging CLI flags over config file.
+	serveCfg := cfg.Serve
+	if *auth != "" {
+		serveCfg.AuthMode = *auth
+	}
+	if *token != "" {
+		serveCfg.Token = *token
+	}
+	if *behindProxy {
+		serveCfg.BehindProxy = true
+	}
+	mode, err := serve.NormalizeAuthMode(serveCfg.AuthMode)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 1
+	}
+	serveCfg.AuthMode = mode
+	if *password != "" && serveCfg.AuthMode == "password" {
+		// Hash the password at startup so the config never stores plaintext.
+		// If a PasswordHash is already set in config, the CLI password overrides it.
+		h, err := serve.HashPassword(*password)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "failed to hash password:", err)
+			return 1
+		}
+		serveCfg.PasswordHash = h
+	}
+	if serveCfg.AuthMode == "password" && strings.TrimSpace(serveCfg.PasswordHash) == "" {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "auth mode password requires --password or serve.password_hash")
+		return 1
+	}
+
 	var resumeSession *agent.Session
 	if *resume != "" {
 		var err error
@@ -419,6 +472,16 @@ func runServe(args []string) int {
 		}
 	}
 	*model = modelForResumePath(*model, *resume, cfg)
+	// Serve always uses the user's global default_model, ignoring any
+	// project-level override, so the model choice stays consistent across
+	// projects and matches the user's account-level preference.
+	if *model == "" {
+		if uc := config.UserConfigPath(); uc != "" {
+			if userCfg := config.LoadForEdit(uc); userCfg != nil && userCfg.DefaultModel != "" {
+				*model = userCfg.DefaultModel
+			}
+		}
+	}
 	ctrl, err := setup(ctx, *model, *maxSteps, true, bc)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
@@ -429,15 +492,30 @@ func runServe(args []string) int {
 	// Auto-save target: reuse the resumed file, else a fresh one — same as chat.
 	if *resume != "" {
 		ctrl.Resume(resumeSession, *resume)
-	} else if ctrl.SessionDir() != "" {
-		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
+	}
+	ctrl.EnsureSessionPath()
+
+	srv := serve.New(ctrl, bc, serveCfg)
+	fmt.Printf("reasonix serve — %s on http://%s\n", ctrl.Label(), *addr)
+	if srv.AuthMode() == "token" {
+		fmt.Printf("  auth: token\n")
+		fmt.Printf("  share: http://%s/?token=%s\n", *addr, srv.AuthToken())
+	} else if srv.AuthMode() == "password" {
+		fmt.Printf("  auth: password (login at http://%s/login)\n", *addr)
+	}
+	// Diagnostic: check whether balance endpoint is reachable
+	if b, err := ctrl.Balance(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "  balance: error — %v\n", err)
+	} else if b == nil {
+		fmt.Fprintf(os.Stderr, "  balance: not configured (no balance_url for this provider)\n")
+	} else {
+		fmt.Printf("  balance: %s\n", b.Display())
 	}
 
-	fmt.Printf("reasonix serve — %s on http://%s\n", ctrl.Label(), *addr)
 	// Use graceful shutdown so SIGINT/SIGTERM drain active connections.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := serve.New(ctrl, bc).RunGraceful(ctx, *addr); err != nil {
+	if err := srv.RunGraceful(ctx, *addr); err != nil {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 		return 1
 	}
@@ -518,15 +596,14 @@ func chatREPL(args []string) int {
 	// file so closing/reopening keeps appending to the same history; a fresh
 	// session lands in a new file stamped with the model name.
 	if resumePath != "" {
-		if loaded, err := agent.LoadSession(resumePath); err != nil {
+		loaded, err := agent.LoadSession(resumePath)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
 			return 1
-		} else {
-			ctrl.Resume(loaded, resumePath)
 		}
-	} else if ctrl.SessionDir() != "" {
-		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
+		ctrl.Resume(loaded, resumePath)
 	}
+	ctrl.EnsureSessionPath()
 
 	// Surface a missing-key warning inside the TUI banner so the first message
 	// failing is at least pre-announced; the user can still enter chat.
@@ -578,11 +655,7 @@ func chatREPL(args []string) int {
 		// Keep the carried conversation in its existing file so the switch doesn't
 		// orphan a duplicate (#2807).
 		path := agent.ContinueSessionPath(resumePath, c.SessionDir(), c.Label())
-		if len(carry) > 0 {
-			c.Resume(&agent.Session{Messages: carry}, path)
-		} else if path != "" {
-			c.SetSessionPath(path)
-		}
+		c.AdoptHistory(carry, path)
 		c.EnableInteractiveApproval()
 		if *yolo {
 			c.SetAutoApproveTools(true)
@@ -660,7 +733,7 @@ func reserveNativeScrollbackFrame(w io.Writer, rows int) {
 }
 
 // setupTargets is where the wizard writes: the TOML config and the credential
-// store. Keys always go to the reasonix-owned global credential store so they
+// store. Keys always go to Reasonix's global .env so they
 // never land in a project's own .env; only the config location is project-local
 // under --local.
 type setupTargets struct {
@@ -678,7 +751,7 @@ func defaultConfigTarget() string {
 }
 
 // defaultEnvTarget is the display target for the reasonix-owned global
-// credential store.
+// Reasonix global .env.
 func defaultEnvTarget() string {
 	return config.CredentialsTargetDescription()
 }
@@ -709,8 +782,7 @@ func displayPath(p string) string {
 
 // setupConfig runs the configuration wizard (the `reasonix setup` command),
 // writing config.toml to the user-global dir (or ./reasonix.toml under --local)
-// and API keys to the reasonix-owned global credential store — never a project's
-// own .env.
+// and API keys to Reasonix's global .env — never a project's own .env.
 // Project memory is a separate concern — the in-session `/init` skill generates
 // AGENTS.md (see initHint).
 func setupConfig(args []string) int {
@@ -766,7 +838,7 @@ func initHint() int {
 }
 
 // interactiveSetup runs the setup wizard, then writes the config to configPath
-// and any entered API keys to the configured global credential store. The wizard
+// and any entered API keys to Reasonix's global .env. The wizard
 // is intentionally minimal: pick language, pick
 // provider, enter API keys. Language is asked first so every subsequent prompt
 // is already in the user's language even when env auto-detection got it wrong.
@@ -1011,10 +1083,11 @@ func familyStaticModels(providers []config.ProviderEntry, idxs []int) []string {
 // ensureProbeKey prompts once for the family's API key when it isn't already in
 // the environment, so the /models probe can run and return the live SKU list.
 // The value is set in the env for the probe; configureKeys returns the same key
-// for the credential store later and skips re-asking. A blank entry is fine —
+// for Reasonix's global .env later and skips re-asking. A blank entry is fine —
 // the static fallback covers it.
 func ensureProbeKey(probe *config.ProviderEntry, famName string) {
 	if probe.APIKeyEnv == "" || os.Getenv(probe.APIKeyEnv) != "" {
+		probe.ResolveAPIKeyFromProcessEnvForProbe()
 		return
 	}
 	fmt.Printf("  %s\n", dim(fmt.Sprintf(i18n.M.FamilyKeyPromptFmt, famName)))
@@ -1022,6 +1095,7 @@ func ensureProbeKey(probe *config.ProviderEntry, famName string) {
 	if key := strings.TrimSpace(ask(in, os.Stdout, "  "+probe.APIKeyEnv, "")); key != "" {
 		os.Setenv(probe.APIKeyEnv, key)
 	}
+	probe.ResolveAPIKeyFromProcessEnvForProbe()
 }
 
 // fetchOrFallback tries the OpenAI-compatible GET /models endpoint
@@ -1245,7 +1319,7 @@ func promptCustomProviderManual() ([]config.ProviderEntry, error) {
 // Pre-filled values (baseURL, keyEnv, apiKey) are reused as-is when non-empty
 // so the URL-fetch flow can fall through to manual entry without re-asking
 // the user for information they've already typed. An empty apiKey is allowed
-// — the key step happens later in the wizard and the credential store is updated then.
+// — the key step happens later in the wizard and Reasonix's global .env is updated then.
 func promptCustomProviderManualWith(in *bufio.Scanner, baseURL, keyEnv, apiKey string) ([]config.ProviderEntry, error) {
 	fmt.Println()
 	if baseURL == "" {
@@ -1524,8 +1598,8 @@ func providersWithMissingKeys(cfg *config.Config) []config.ProviderEntry {
 // setup asks whether to re-enter it; Enter keeps and re-pins the existing value.
 // Otherwise the user is asked once per env var (deduped across providers that
 // share one, e.g. both DeepSeek models). Returns KEY=value lines for the
-// configured credential store. Re-pinning matters because loadDotEnv is first-wins, so a stale key left
-// earlier in the credentials file would otherwise keep shadowing the fresh value.
+// Reasonix global .env. Re-pinning keeps hand-edited or previously saved values
+// aligned with the user's latest setup choice.
 func configureKeys(selected []config.ProviderEntry, r io.Reader, w io.Writer) []string {
 	in := bufio.NewScanner(r)
 	fmt.Fprintln(w, "\n"+i18n.M.EnterAPIKeysHeader)
@@ -1588,8 +1662,7 @@ func isTTY(f *os.File) bool {
 // appendEnv merges KEY=value lines into a .env file. Existing assignments of
 // any key that's about to be written are dropped first, then the new values
 // are appended — so re-running `reasonix setup` with a corrected key replaces the
-// stale one instead of stacking duplicates (loadDotEnv is first-wins, so a
-// naive append would leave the old key in effect). The new values are also
+// stale one instead of stacking duplicates. The new values are also
 // pinned into the current process env so a chat session started right after
 // init picks up the fresh keys without a restart.
 func appendEnv(path string, lines []string) error {
@@ -1661,6 +1734,8 @@ func configCommand(args []string) int {
 	switch args[0] {
 	case "auto-plan":
 		return configAutoPlanCommand(args[1:])
+	case "memory-v5":
+		return configMemoryV5Command(args[1:])
 	case "reasoning-language":
 		return configReasoningLanguageCommand(args[1:])
 	default:
@@ -1671,8 +1746,12 @@ func configCommand(args []string) int {
 
 func configAutoPlanCommand(args []string) int {
 	fs := flag.NewFlagSet("config auto-plan", flag.ContinueOnError)
-	local := fs.Bool("local", false, "write ./reasonix.toml instead of the user config")
+	local := fs.Bool("local", false, "unsupported; auto-plan is user-level only")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *local {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "auto-plan is user-level only; --local is not supported")
 		return 2
 	}
 	rest := fs.Args()
@@ -1692,31 +1771,9 @@ func configAutoPlanCommand(args []string) int {
 		return 0
 	}
 	path := config.UserConfigPath()
-	if *local {
-		path = "reasonix.toml"
-	}
 	if path == "" {
 		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "cannot resolve config path")
 		return 1
-	}
-	if *local {
-		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-			probe := config.Default()
-			if err := probe.SetAutoPlan(rest[0]); err != nil {
-				fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-				return 2
-			}
-			mode, err := config.SaveMinimalProjectAutoPlan(path, rest[0])
-			if err != nil {
-				fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-				return 1
-			}
-			fmt.Printf("auto_plan = %q (%s)\n", mode, displayPath(path))
-			return 0
-		} else if err != nil {
-			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
-			return 1
-		}
 	}
 	cfg := config.LoadForEdit(path)
 	if err := cfg.SetAutoPlan(rest[0]); err != nil {
@@ -1728,6 +1785,53 @@ func configAutoPlanCommand(args []string) int {
 		return 1
 	}
 	fmt.Printf("auto_plan = %q (%s)\n", cfg.Agent.AutoPlan, displayPath(path))
+	return 0
+}
+
+func configMemoryV5Command(args []string) int {
+	fs := flag.NewFlagSet("config memory-v5", flag.ContinueOnError)
+	local := fs.Bool("local", false, "unsupported; Memory v5 is user-level only")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *local {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "memory-v5 is user-level only; --local is not supported")
+		return 2
+	}
+	rest := fs.Args()
+	if len(rest) > 1 {
+		configMemoryV5Usage()
+		return 2
+	}
+	if len(rest) == 0 || strings.EqualFold(rest[0], "status") {
+		cfg, err := config.Load()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		fmt.Printf("memory_compiler.enabled = %v\n", cfg.MemoryCompilerEnabled())
+		return 0
+	}
+	enabled, err := parseCLIMemoryV5Mode(rest[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 2
+	}
+	path := config.UserConfigPath()
+	if path == "" {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, "cannot resolve config path")
+		return 1
+	}
+	cfg := config.LoadForEdit(path)
+	if err := cfg.SetMemoryCompilerEnabled(enabled); err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 2
+	}
+	if err := cfg.SaveTo(path); err != nil {
+		fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+		return 1
+	}
+	fmt.Printf("memory_compiler.enabled = %v (%s)\n", cfg.MemoryCompilerEnabled(), displayPath(path))
 	return 0
 }
 
@@ -1793,14 +1897,21 @@ func configReasoningLanguageCommand(args []string) int {
 
 func configUsage() {
 	fmt.Print(`Usage:
-  reasonix config auto-plan [--local] [off|on]
+  reasonix config auto-plan [off|on]
+  reasonix config memory-v5 [off|on|status]
   reasonix config reasoning-language [--local] [auto|zh|en]
 `)
 }
 
 func configAutoPlanUsage() {
 	fmt.Print(`Usage:
-  reasonix config auto-plan [--local] [off|on]
+  reasonix config auto-plan [off|on]
+`)
+}
+
+func configMemoryV5Usage() {
+	fmt.Print(`Usage:
+  reasonix config memory-v5 [off|on|status]
 `)
 }
 
