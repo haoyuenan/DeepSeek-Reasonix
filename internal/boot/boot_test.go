@@ -1783,7 +1783,7 @@ model = "x"
 func TestAddBuiltinsWithWorkspaceRootKeepsSessionTools(t *testing.T) {
 	reg := tool.NewRegistry()
 	var stderr bytes.Buffer
-	addBuiltins(reg, nil, []string{robustTempDir(t)}, sandbox.Spec{}, 120*time.Second, builtin.SearchSpec{}, &stderr, robustTempDir(t), netclient.ProxySpec{})
+	addBuiltins(reg, nil, []string{robustTempDir(t)}, sandbox.Spec{}, 120*time.Second, builtin.SearchSpec{}, &stderr, robustTempDir(t), netclient.ProxySpec{}, nil, nil)
 	for _, name := range []string{
 		"todo_write",
 		"complete_step",
@@ -2428,6 +2428,50 @@ func TestPluginSpecsTrustConfiguredReadOnlyTools(t *testing.T) {
 	}
 	if specs[0].ReadOnlyToolNames[""] {
 		t.Fatalf("empty trusted read-only tool name should be ignored: %+v", specs[0].ReadOnlyToolNames)
+	}
+}
+
+func TestPluginSpecsMapConfiguredCallTimeouts(t *testing.T) {
+	specs := PluginSpecsForRootWithOptions([]config.PluginEntry{{
+		Name:               "maker",
+		Command:            "maker-mcp",
+		CallTimeoutSeconds: 600,
+		ToolTimeoutSeconds: map[string]int{
+			"generate_video": 1800,
+			" ":              120,
+			"zero":           0,
+		},
+	}}, "", PluginSpecOptions{DefaultCallTimeout: 300 * time.Second})
+	if len(specs) != 1 {
+		t.Fatalf("PluginSpecs returned %d specs, want 1", len(specs))
+	}
+	if specs[0].DefaultCallTimeout != 5*time.Minute {
+		t.Fatalf("DefaultCallTimeout = %v, want 5m", specs[0].DefaultCallTimeout)
+	}
+	if specs[0].CallTimeout != 10*time.Minute {
+		t.Fatalf("CallTimeout = %v, want 10m", specs[0].CallTimeout)
+	}
+	if specs[0].ToolTimeouts["generate_video"] != 30*time.Minute {
+		t.Fatalf("generate_video timeout = %v, want 30m", specs[0].ToolTimeouts["generate_video"])
+	}
+	if _, ok := specs[0].ToolTimeouts["zero"]; ok {
+		t.Fatalf("zero tool timeout should be ignored: %+v", specs[0].ToolTimeouts)
+	}
+	if _, ok := specs[0].ToolTimeouts[""]; ok {
+		t.Fatalf("empty tool timeout should be ignored: %+v", specs[0].ToolTimeouts)
+	}
+}
+
+func TestApplyDefaultMCPCallTimeoutPreservesConfiguredDefault(t *testing.T) {
+	specs := applyDefaultMCPCallTimeout([]plugin.Spec{
+		{Name: "configured", DefaultCallTimeout: 2 * time.Minute},
+		{Name: "empty"},
+	}, 5*time.Minute)
+	if specs[0].DefaultCallTimeout != 2*time.Minute {
+		t.Fatalf("configured DefaultCallTimeout overwritten: %v", specs[0].DefaultCallTimeout)
+	}
+	if specs[1].DefaultCallTimeout != 5*time.Minute {
+		t.Fatalf("empty DefaultCallTimeout = %v, want 5m", specs[1].DefaultCallTimeout)
 	}
 }
 

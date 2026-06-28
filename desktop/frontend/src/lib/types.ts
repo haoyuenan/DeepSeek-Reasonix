@@ -397,6 +397,10 @@ export interface ContextInfo {
   window: number;
   sessionTokens: number;
   compactRatio?: number;
+  sessionCost?: number;
+  sessionCurrency?: string;
+  cacheHitTokens?: number;
+  cacheMissTokens?: number;
 }
 
 export interface Meta {
@@ -492,13 +496,17 @@ export interface CommandInfo {
 
 export interface DirEntry {
   name: string;
+  path?: string;
   isDir: boolean;
+  displayName?: string;
+  displayPath?: string;
 }
 
 export interface DroppedItem {
   kind: "workspace" | "attachment";
   path: string;
   isDir?: boolean;
+  displayPath?: string;
   previewUrl?: string;
 }
 

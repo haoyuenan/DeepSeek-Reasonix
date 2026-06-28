@@ -62,6 +62,41 @@ func TestUserConfigPathHonorsReasonixHome(t *testing.T) {
 	}
 }
 
+func TestLoadForRootUsesWindowsHomeFallbackWhenConfigDirUnavailable(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+
+	oldGOOS := runtimeGOOS
+	oldConfigDir := osUserConfigDir
+	oldHomeDir := osUserHomeDir
+	runtimeGOOS = "windows"
+	osUserConfigDir = func() string { return "" }
+	osUserHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() {
+		runtimeGOOS = oldGOOS
+		osUserConfigDir = oldConfigDir
+		osUserHomeDir = oldHomeDir
+	})
+
+	t.Setenv("REASONIX_HOME", "")
+
+	configPath := filepath.Join(home, "AppData", "Roaming", "reasonix", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("default_model = \"custom/from-home\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadForRoot(project)
+	if err != nil {
+		t.Fatalf("LoadForRoot() error = %v", err)
+	}
+	if cfg.DefaultModel != "custom/from-home" {
+		t.Fatalf("DefaultModel = %q, want %q", cfg.DefaultModel, "custom/from-home")
+	}
+}
+
 func TestRenderTOMLHeaderShowsResolvedConfigPath(t *testing.T) {
 	isolateUserConfigHome(t)
 	out := RenderTOML(Default())
@@ -425,6 +460,46 @@ func TestRenderTOMLDocumentsPluginTrustedReadOnlyTools(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Plugins[0].TrustedReadOnlyTools, cfg.Plugins[0].TrustedReadOnlyTools) {
 		t.Fatalf("TrustedReadOnlyTools round trip = %v, want %v", got.Plugins[0].TrustedReadOnlyTools, cfg.Plugins[0].TrustedReadOnlyTools)
+	}
+}
+
+func TestRenderTOMLPreservesMCPCallTimeouts(t *testing.T) {
+	cfg := Default()
+	cfg.Tools.MCPCallTimeoutSeconds = intPtr(450)
+	cfg.Plugins = []PluginEntry{{
+		Name:               "maker",
+		Command:            "maker-mcp",
+		CallTimeoutSeconds: 600,
+		ToolTimeoutSeconds: map[string]int{
+			"generate/video": 1800,
+			"search":         120,
+		},
+	}}
+
+	rendered := RenderTOML(cfg)
+	for _, want := range []string{
+		"mcp_call_timeout_seconds = 450",
+		"call_timeout_seconds = 600",
+		`tool_timeout_seconds = { "generate/video" = 1800, "search" = 120 }`,
+		"Raw MCP tool names",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered config missing %q:\n%s", want, rendered)
+		}
+	}
+
+	var got Config
+	if _, err := toml.Decode(rendered, &got); err != nil {
+		t.Fatalf("rendered TOML does not parse: %v\n%s", err, rendered)
+	}
+	if got.Tools.MCPCallTimeoutSeconds == nil || *got.Tools.MCPCallTimeoutSeconds != 450 {
+		t.Fatalf("MCPCallTimeoutSeconds round trip = %v, want 450", got.Tools.MCPCallTimeoutSeconds)
+	}
+	if got.Plugins[0].CallTimeoutSeconds != 600 {
+		t.Fatalf("CallTimeoutSeconds round trip = %d, want 600", got.Plugins[0].CallTimeoutSeconds)
+	}
+	if !reflect.DeepEqual(got.Plugins[0].ToolTimeoutSeconds, cfg.Plugins[0].ToolTimeoutSeconds) {
+		t.Fatalf("ToolTimeoutSeconds round trip = %v, want %v", got.Plugins[0].ToolTimeoutSeconds, cfg.Plugins[0].ToolTimeoutSeconds)
 	}
 }
 

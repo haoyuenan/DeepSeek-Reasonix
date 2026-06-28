@@ -519,6 +519,7 @@ context_window = 1000000   # tokens; harness compacts older history near this li
 [tools]
 enabled = []   # omit/empty = all built-ins
 bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local cap
+mcp_call_timeout_seconds = 300   # default MCP call safety cap; plugin/tool overrides may raise it
 
 [tools.shell]
 prefer = "auto"   # auto (default) | bash | powershell | pwsh — force the shell tool's interpreter
@@ -538,6 +539,7 @@ ask   = []                                 # force a prompt even if otherwise al
 [sandbox]
 # workspace_root = ""          # file-writers confined here; empty = cwd
 # allow_write    = ["/tmp"]    # extra dirs write_file/edit_file/multi_edit/move_file may modify
+# forbid_read    = ["${HOME}/.ssh"]   # dirs read/list/search tools and sandboxed bash may not inspect
 
 [serve]
 auth_mode = "none"             # none|token|password; use auth before binding beyond localhost
@@ -550,6 +552,8 @@ name    = "example"            # type defaults to "stdio"
 command = "reasonix-plugin-example"
 args    = []
 # env   = { FOO = "bar" }
+# call_timeout_seconds = 600            # per-server MCP call timeout; 0 = global/default cap
+# tool_timeout_seconds = { "generate_video" = 1800 }   # raw MCP tool names
 # trusted_read_only_tools = ["search"]   # optional pre-seeded MCP read-only trust
 
 # [[plugins]]                   # a remote MCP server over Streamable HTTP
@@ -589,11 +593,15 @@ config dir, plus `allow_write`: a write whose target — resolved to an absolute
 symlink-free path so a symlinked dir or `..` cannot tunnel out — falls outside
 every root is refused, and the error is fed back to the model. Confinement is on
 by default (root = cwd), so edits stay in the project while the agent can still
-update its own global config; reads are unrestricted. `bash` is itself jailed on
-macOS by default (`[sandbox] bash = "enforce"`, Seatbelt): each command runs
-under sandbox-exec allowed to write only the same roots (+ temp and toolchain
-caches) and to reach the network only when `network = true`. Unsupported platforms fall back to
-running unconfined. The escape-prompt and Linux support are Phase 1's remainder (§9).
+update its own global config. `forbid_read` lists directories the agent should
+not read, list, or search; entries support `${VAR}` / `${VAR:-default}` expansion
+and should be absolute, or use `${HOME}` for home-relative secrets such as
+`${HOME}/.ssh`. `bash` is itself jailed on macOS by default
+(`[sandbox] bash = "enforce"`, Seatbelt): each command runs under sandbox-exec
+allowed to write only the same roots (+ temp and toolchain caches), denied reads
+under `forbid_read`, and allowed to reach the network only when `network = true`.
+Unsupported platforms fall back to running unconfined when no OS sandbox is
+available. The escape-prompt and Linux support are Phase 1's remainder (§9).
 
 ## 6. Error Handling
 

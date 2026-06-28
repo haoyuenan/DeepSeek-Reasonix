@@ -263,7 +263,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 
 	reg := tool.NewRegistry()
-	bashSpec := sandbox.Spec{Mode: cfg.BashMode(), WriteRoots: cfg.WriteRootsForRoot(root), Network: cfg.Sandbox.Network}
+	bashSpec := sandbox.Spec{Mode: cfg.BashMode(), WriteRoots: cfg.WriteRootsForRoot(root), ForbidReadRoots: cfg.ForbidReadRootsForRoot(root), Network: cfg.Sandbox.Network}
 	shell := sandbox.ResolveShell(cfg.Tools.Shell.Prefer, cfg.Tools.Shell.Path, stderr)
 	bashSpec.Shell = shell
 	if bashSpec.Mode == "enforce" && !sandbox.Available() {
@@ -278,7 +278,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if tokenEconomy {
 		enabledBuiltins = tokenEconomyBuiltins(enabledBuiltins)
 	}
-	addBuiltins(reg, enabledBuiltins, cfg.WriteRootsForRoot(root), bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec)
+	readPathResolver := builtin.NewPathResolver()
+	addBuiltins(reg, enabledBuiltins, cfg.WriteRootsForRoot(root), bashSpec, bashTimeout, searchSpec, stderr, root, proxySpec, cfg.ForbidReadRootsForRoot(root), readPathResolver)
 	// Use the caller-supplied shared host when set, so controllers for the same
 	// workspace root reuse running MCP processes (e.g. one CodeGraph daemon
 	// instead of one per tab). Otherwise construct a private host per controller.
@@ -289,13 +290,20 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 
 	// Partition configured plugins by tier so eager can block when explicitly
 	// requested while every other enabled MCP warms up in the background.
+	pluginSpecOptions := PluginSpecOptions{
+		DefaultCallTimeout:   time.Duration(cfg.MCPCallTimeoutSeconds()) * time.Second,
+		PlanModeAllowedTools: cfg.Agent.PlanModeAllowedTools,
+	}
 	autoStartEntries := cfg.AutoStartPlugins()
 	eagerEntries, bgEntries := partitionByTier(autoStartEntries)
-	extraSpecs := applyPlanModeAllowedMCPToolTrust(applyKnownPluginOverrides(opts.ExtraPlugins, root), cfg.Agent.PlanModeAllowedTools)
+	extraSpecs := applyDefaultMCPCallTimeout(
+		applyPlanModeAllowedMCPToolTrust(applyKnownPluginOverrides(opts.ExtraPlugins, root), cfg.Agent.PlanModeAllowedTools),
+		pluginSpecOptions.DefaultCallTimeout,
+	)
 	onDemandMCPSpecs := map[string]plugin.Spec{}
 	onDemandMCPNames := []string{}
 	if tokenEconomy {
-		for _, spec := range append(PluginSpecsForRootWithPlanModeAllowedTools(autoStartEntries, root, cfg.Agent.PlanModeAllowedTools), extraSpecs...) {
+		for _, spec := range append(PluginSpecsForRootWithOptions(autoStartEntries, root, pluginSpecOptions), extraSpecs...) {
 			name := strings.TrimSpace(spec.Name)
 			if name == "" {
 				continue
@@ -327,8 +335,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 	eagerEntries = kept
 
-	eagerSpecs := PluginSpecsForRootWithPlanModeAllowedTools(eagerEntries, root, cfg.Agent.PlanModeAllowedTools)
-	bgSpecs := PluginSpecsForRootWithPlanModeAllowedTools(bgEntries, root, cfg.Agent.PlanModeAllowedTools)
+	eagerSpecs := PluginSpecsForRootWithOptions(eagerEntries, root, pluginSpecOptions)
+	bgSpecs := PluginSpecsForRootWithOptions(bgEntries, root, pluginSpecOptions)
 
 	if !tokenEconomy {
 		eagerSpecs = append(eagerSpecs, extraSpecs...)
@@ -782,7 +790,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			ProjectRoot: root,
 			HTTPClient:  balanceClient,
 			ConnectMCP: func(e config.PluginEntry) (installsource.MCPConnectResult, error) {
-				spec := pluginSpecFromEntry(e, root)
+				spec := pluginSpecFromEntryWithOptions(e, root, pluginSpecOptions)
 				if opts.Stderr != nil {
 					spec.Stderr = opts.Stderr
 				}
@@ -1031,6 +1039,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		Registry:               reg,
 		PluginCtx:              ctx,
 		WorkspaceRoot:          root,
+		ExternalFolderToolRefs: readPathResolver,
 		AutoPlan:               cfg.Agent.AutoPlan,
 		ResponseLanguage:       cfg.ResponseLanguage(),
 		ReasoningLanguage:      cfg.ReasoningLanguage(),
@@ -1335,14 +1344,16 @@ func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (p
 // them. writeRoots confines the file-writing built-ins to the workspace: after
 // the (unconfined) defaults are added, each enabled writer is replaced by an
 // instance bound to writeRoots (preserving registry order).
+// forbidReadRoots confines the read/list/search built-ins so they cannot peek at
+// the listed directories.
 // When workDir is non-empty, tools resolve relative paths against it instead of
 // the process cwd, enabling concurrent multi-project sessions.
-func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec) {
+func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, bashTimeout time.Duration, searchSpec builtin.SearchSpec, stderr io.Writer, workDir string, proxySpec netclient.ProxySpec, forbidReadRoots []string, readPathResolver *builtin.PathResolver) {
 	// If a workspace directory is set, use workspace-bound tools that resolve
 	// paths relative to that directory. Otherwise fall back to the process-cwd
 	// compile-time builtins.
 	if workDir != "" {
-		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec}
+		ws := builtin.Workspace{Dir: workDir, WriteRoots: writeRoots, ForbidReadRoots: forbidReadRoots, Bash: bashSpec, BashTimeout: bashTimeout, Search: searchSpec, ProxySpec: proxySpec, ReadPaths: readPathResolver}
 		for _, t := range ws.Tools(enabled...) {
 			reg.Add(t)
 		}
@@ -1363,9 +1374,14 @@ func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sand
 		}
 	}
 	// Replace the unconfined defaults with confined instances (registry order is
-	// preserved on replace): file-writers bound to the workspace, bash to the OS
-	// sandbox, web_fetch to the proxy. Only replace tools actually enabled/present.
-	confined := append(builtin.ConfineWriters(writeRoots), builtin.ConfineBash(bashSpec, bashTimeout), builtin.ConfineSearch(searchSpec), builtin.ConfineWebFetch(proxySpec))
+	// preserved on replace): file-writers bound to the workspace, read tools
+	// bound to forbid-read roots, bash to the OS sandbox, web_fetch to the proxy.
+	// Only replace tools actually enabled/present.
+	confined := append(builtin.ConfineWriters(writeRoots),
+		builtin.ConfineBash(bashSpec, bashTimeout),
+		builtin.ConfineSearch(searchSpec, bashSpec, forbidReadRoots),
+		builtin.ConfineWebFetch(proxySpec))
+	confined = append(confined, builtin.ConfineReaders(forbidReadRoots)...)
 	for _, t := range confined {
 		if _, ok := reg.Get(t.Name()); ok {
 			reg.Add(t)
@@ -1414,36 +1430,93 @@ func PluginSpecsForRoot(entries []config.PluginEntry, workspaceRoot string) []pl
 	return PluginSpecsForRootWithPlanModeAllowedTools(entries, workspaceRoot, nil)
 }
 
+// PluginSpecOptions carries runtime policy that is not stored on each plugin
+// entry but still needs to reach plugin.Spec.
+type PluginSpecOptions struct {
+	DefaultCallTimeout   time.Duration
+	PlanModeAllowedTools []string
+}
+
 // PluginSpecsForRootWithPlanModeAllowedTools also promotes model-visible MCP
 // names declared in agent.plan_mode_allowed_tools to trusted read-only model
 // names for their matching server. This keeps the planner/read-only research
 // trust path aligned with the plan-mode execution escape valve.
 func PluginSpecsForRootWithPlanModeAllowedTools(entries []config.PluginEntry, workspaceRoot string, allowedTools []string) []plugin.Spec {
-	specs := make([]plugin.Spec, len(entries))
-	for i, e := range entries {
-		specs[i] = pluginSpecFromEntry(e, workspaceRoot)
-	}
-	return applyPlanModeAllowedMCPToolTrust(specs, allowedTools)
+	return PluginSpecsForRootWithOptions(entries, workspaceRoot, PluginSpecOptions{
+		PlanModeAllowedTools: allowedTools,
+	})
 }
 
-func pluginSpecFromEntry(e config.PluginEntry, workspaceRoot string) plugin.Spec {
+// PluginSpecsForRootWithOptions maps configured plugin entries to plugin.Spec
+// and injects runtime policy such as the global MCP call timeout.
+func PluginSpecsForRootWithOptions(entries []config.PluginEntry, workspaceRoot string, opts PluginSpecOptions) []plugin.Spec {
+	specs := make([]plugin.Spec, len(entries))
+	for i, e := range entries {
+		specs[i] = pluginSpecFromEntryWithOptions(e, workspaceRoot, opts)
+	}
+	return applyPlanModeAllowedMCPToolTrust(specs, opts.PlanModeAllowedTools)
+}
+
+func pluginSpecFromEntryWithOptions(e config.PluginEntry, workspaceRoot string, opts PluginSpecOptions) plugin.Spec {
 	e = e.ExpandedPlugin() // resolve ${VAR} / ${VAR:-default} from the environment
 	return plugin.ApplyKnownOverrides(plugin.Spec{
-		Name:              e.Name,
-		Type:              e.Type,
-		Command:           e.Command,
-		Args:              e.Args,
-		Env:               e.Env,
-		URL:               e.URL,
-		Headers:           e.Headers,
-		ReadOnlyToolNames: trustedRawReadOnlyToolNames(e.TrustedReadOnlyTools),
+		Name:               e.Name,
+		Type:               e.Type,
+		Command:            e.Command,
+		Args:               e.Args,
+		Env:                e.Env,
+		URL:                e.URL,
+		Headers:            e.Headers,
+		DefaultCallTimeout: opts.DefaultCallTimeout,
+		CallTimeout:        secondsDuration(e.CallTimeoutSeconds),
+		ToolTimeouts:       toolTimeoutDurations(e.ToolTimeoutSeconds),
+		ReadOnlyToolNames:  trustedRawReadOnlyToolNames(e.TrustedReadOnlyTools),
 	}, workspaceRoot)
+}
+
+func secondsDuration(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func toolTimeoutDurations(seconds map[string]int) map[string]time.Duration {
+	if len(seconds) == 0 {
+		return nil
+	}
+	out := make(map[string]time.Duration, len(seconds))
+	for name, sec := range seconds {
+		name = strings.TrimSpace(name)
+		if name == "" || sec <= 0 {
+			continue
+		}
+		out[name] = time.Duration(sec) * time.Second
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func applyKnownPluginOverrides(specs []plugin.Spec, workspaceRoot string) []plugin.Spec {
 	out := make([]plugin.Spec, len(specs))
 	for i, spec := range specs {
 		out[i] = plugin.ApplyKnownOverrides(spec, workspaceRoot)
+	}
+	return out
+}
+
+func applyDefaultMCPCallTimeout(specs []plugin.Spec, timeout time.Duration) []plugin.Spec {
+	if len(specs) == 0 || timeout <= 0 {
+		return specs
+	}
+	out := make([]plugin.Spec, len(specs))
+	for i, spec := range specs {
+		out[i] = spec
+		if out[i].DefaultCallTimeout <= 0 {
+			out[i].DefaultCallTimeout = timeout
+		}
 	}
 	return out
 }
