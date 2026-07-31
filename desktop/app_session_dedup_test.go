@@ -642,6 +642,41 @@ func TestEnsureBlankTabDoesNotReuseProjectTopicWithSession(t *testing.T) {
 	}
 }
 
+// EnsureBlankTab must not reuse a tombstoned topic: the reused ID would flow
+// into ensureTopicIndexed, whose intentional prepend clears the delete
+// tombstone and resurrects the topic the user removed.
+func TestEnsureBlankTabDoesNotReuseTombstonedTopic(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	// Race product on disk: deleted topic whose default title lingered in the
+	// global title map (title-only, absent from GlobalTopics, no sessions).
+	tombstonedID := "topic_tombstone_blank"
+	if err := setTopicTitle("", tombstonedID, defaultTopicTitle); err != nil {
+		t.Fatalf("set lingering title: %v", err)
+	}
+	if err := updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+		f.DeletedTopics = prependUniqueString(f.DeletedTopics, tombstonedID)
+		return true, nil
+	}); err != nil {
+		t.Fatalf("seed tombstone: %v", err)
+	}
+
+	meta, err := NewApp().EnsureBlankTab("global", "")
+	if err != nil {
+		t.Fatalf("EnsureBlankTab: %v", err)
+	}
+	if meta.TopicID == tombstonedID {
+		t.Fatalf("EnsureBlankTab reused tombstoned topic %q", meta.TopicID)
+	}
+	f := loadProjectsFile()
+	if !containsDesktopString(f.DeletedTopics, tombstonedID) {
+		t.Fatalf("deletedTopics = %#v, tombstone must survive blank-tab creation", f.DeletedTopics)
+	}
+	if containsDesktopString(f.GlobalTopics, tombstonedID) {
+		t.Fatalf("globalTopics = %#v, tombstoned topic must not be re-indexed", f.GlobalTopics)
+	}
+}
+
 // NewSession skips the snapshot when the current tab has no real conversation content.
 
 func TestNewSessionNoopsWhenCurrentTabIsBlank(t *testing.T) {
@@ -700,7 +735,6 @@ func TestNewSessionUsesFreshTopicIdentity(t *testing.T) {
 	if newPath == "" || filepath.Clean(newPath) == filepath.Clean(oldPath) {
 		t.Fatalf("new session path = %q, want fresh path distinct from %q", newPath, oldPath)
 	}
-
 	if err := os.WriteFile(newPath, []byte(`{"role":"user","content":"new prompt"}`+"\n"), 0o644); err != nil {
 		t.Fatalf("write new session: %v", err)
 	}
