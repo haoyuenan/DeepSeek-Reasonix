@@ -1214,26 +1214,33 @@ type AgentConfig struct {
 // token budget; the harness compacts older history as a turn's prompt approaches
 // it (see agent compaction). 0 disables compaction for the instance.
 type ProviderEntry struct {
-	Name           string            `toml:"name"`
-	Kind           string            `toml:"kind"`
-	BaseURL        string            `toml:"base_url"`
-	ChatURL        string            `toml:"chat_url"`
-	Model          string            `toml:"model"`      // a single model (back-compat)
-	Models         []string          `toml:"models"`     // a vendor's model list (one base_url/key, many models)
-	ModelsURL      string            `toml:"models_url"` // auto-fetch models from this URL on startup
-	Default        string            `toml:"default"`    // default model when Models is set (else Models[0])
-	APIKeyEnv      string            `toml:"api_key_env"`
-	PresetID       string            `toml:"preset_id"`      // curated preset identity; UI-only metadata, not sent to model providers.
-	PresetVersion  int               `toml:"preset_version"` // curated preset schema version for future migrations.
-	Headers        map[string]string `toml:"headers"`        // optional extra HTTP headers for compatible gateways; secrets should stay in api_key_env.
-	ExtraBody      map[string]any    `toml:"extra_body"`     // optional extra top-level JSON request body fields for OpenAI-compatible gateways.
-	AuthHeader     bool              `toml:"auth_header"`    // for Anthropic-compatible gateways that expect Authorization: Bearer instead of x-api-key.
-	resolvedAPIKey string
-	resolvedSource CredentialSource
-	BalanceURL     string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
-	ContextWindow  int                          `toml:"context_window"`
-	Price          *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
-	Prices         map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
+	Name          string            `toml:"name"`
+	Kind          string            `toml:"kind"`
+	BaseURL       string            `toml:"base_url"`
+	ChatURL       string            `toml:"chat_url"`
+	Model         string            `toml:"model"`      // a single model (back-compat)
+	Models        []string          `toml:"models"`     // a vendor's model list (one base_url/key, many models)
+	ModelsURL     string            `toml:"models_url"` // auto-fetch models from this URL on startup
+	Default       string            `toml:"default"`    // default model when Models is set (else Models[0])
+	APIKeyEnv     string            `toml:"api_key_env"`
+	PresetID      string            `toml:"preset_id"`      // curated preset identity; UI-only metadata, not sent to model providers.
+	PresetVersion int               `toml:"preset_version"` // curated preset schema version for future migrations.
+	Headers       map[string]string `toml:"headers"`        // optional extra HTTP headers for compatible gateways; secrets should stay in api_key_env.
+	ExtraBody     map[string]any    `toml:"extra_body"`     // optional extra top-level JSON request body fields for OpenAI-compatible gateways.
+	AuthHeader    bool              `toml:"auth_header"`    // for Anthropic-compatible gateways that expect Authorization: Bearer instead of x-api-key.
+	// ResponsesMode selects the Responses API context strategy. Empty preserves
+	// vendor detection; DeepSeek is stateless while compatible endpoints may use
+	// stateful previous_response_id continuation.
+	ResponsesMode string `toml:"responses_mode"`
+	// ResponsesStateful is the legacy boolean form retained for config
+	// compatibility. ResponsesMode wins when both are present.
+	ResponsesStateful *bool `toml:"responses_stateful"`
+	resolvedAPIKey    string
+	resolvedSource    CredentialSource
+	BalanceURL        string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
+	ContextWindow     int                          `toml:"context_window"`
+	Price             *provider.Pricing            `toml:"price"`  // legacy/provider-wide fallback
+	Prices            map[string]*provider.Pricing `toml:"prices"` // optional per-model prices; keys are model ids
 
 	persistedOfficialCurrency string
 
@@ -1241,7 +1248,8 @@ type ProviderEntry struct {
 	// via Config.Extra. The anthropic provider reads Thinking="adaptive" to enable
 	// extended thinking and Effort ("low".."max") to tune depth. The
 	// openai-compatible provider forwards Effort as reasoning_effort for
-	// thinking-capable models; DeepSeek accepts high|max.
+	// thinking-capable models; DeepSeek V4 Flash accepts low|high|max while
+	// other DeepSeek models retain their model-specific capability mapping.
 	// Empty = provider default.
 	Thinking string `toml:"thinking"`
 	Effort   string `toml:"effort"`
@@ -1547,10 +1555,11 @@ type ShellConfig struct {
 // fall back to allow. Allow/Ask/Deny are rule lists of the form "ToolName" or
 // "ToolName(glob)". Precedence: deny > ask > allow > fallback.
 type PermissionsConfig struct {
-	Mode  string   `toml:"mode"`
-	Allow []string `toml:"allow"`
-	Ask   []string `toml:"ask"`
-	Deny  []string `toml:"deny"`
+	Mode             string   `toml:"mode"`
+	Allow            []string `toml:"allow"`
+	Ask              []string `toml:"ask"`
+	Deny             []string `toml:"deny"`
+	AllowDynamicBash bool     `toml:"allow_dynamic_bash"`
 }
 
 // MCPConfigSource records where a merged MCP entry came from. It is runtime

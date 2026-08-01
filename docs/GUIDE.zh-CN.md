@@ -243,7 +243,7 @@ host          = "203.0.113.7"
 user          = "dev"
 identity_file = "~/.ssh/id_ed25519"
 workspace     = "~/projects/app"
-serve_install = "auto"            # auto | npm | upload | never
+serve_install = "auto"            # 远端 CLI：auto | npm | upload | never
 
 [[remote.hosts.forwards]]
 type   = "local"                  # local (-L) | remote (-R)
@@ -288,7 +288,9 @@ Remote SSH 的独立 Reasonix 原生窗口。主窗口持有 SSH 隧道；远程
 在桌面端打开 **设置 -> 模型 -> 接入 -> 添加模型服务 -> 自定义供应商**，用于接入代理、
 聚合平台或自建 OpenAI-compatible chat API / Anthropic-compatible Messages API 服务。
 
-常用服务优先使用 **添加模型服务 -> 推荐预设**。Reasonix 可以预填可编辑的自定义 provider：
+常用服务优先使用 **添加模型服务 -> 推荐预设**。DeepSeek 官方服务默认继续使用经过专项适配的
+OpenAI Chat Completions；需要 Anthropic Messages 兼容时，可单独添加 **DeepSeek Anthropic**
+可选预设，两者不会互相替换。Reasonix 还可以预填以下可编辑的自定义 provider：
 Kimi CN、Kimi Global、Kimi Coding Plan、MiMo API、MiMo Anthropic、MiMo Token Plan
 CN/SGP/AMS 及其 Anthropic-compatible 变体、MiniMax CN/Global API、MiniMax
 CN/Global Anthropic、GLM CN、Z.AI Global、GLM/Z.AI Coding Plan 的
@@ -517,7 +519,7 @@ CLI/TUI 文本输入可通过 `[ui].cursor_shape` 设置光标形状，支持 `u
 `Bash(npm run build)`、`Bash(npm run test:*)`、`Edit(docs/**)` 这种形式。
 `reasonix` 会在 writer 调用前征求同意（普通工具为 `1` 本次 · `2` 本会话允许此范围 · `3` 总是允许此范围（保存） · `4` 拒绝；Bash 可额外选择命令前缀授权）；
 其中 Bash 默认按具体命令记，也可按安全推导出的命令前缀记（如 `Bash(go test:*)`）；文件编辑类工具的本会话授权按编辑能力记，持久授权则写入 `Edit(<path>)` 文件路径规则；
-参数/算术展开、赋值、不含嵌套执行的 heredoc、文件重定向和 glob 不能复用裸 `Bash`、前缀或 glob Allow；用户保存时写入整条 `Bash=<literal>`，但它们仍按普通 fallback 执行，因此 Auto 不会额外询问。命令/进程替换、动态命令名、`eval`、`source`、Shell `-c`、运行时内联代码和无法解析的结构才强制人工；无头 Ask/Auto/DontAsk 会拒绝这类未精确授权的命令，只有 YOLO 可以绕过。除此之外 `reasonix run` 保持自主运行并始终遵守 `deny`。
+参数/算术展开、赋值、不含嵌套执行的 heredoc、文件重定向和 glob 不能复用裸 `Bash`、前缀或 glob Allow；用户保存时写入整条 `Bash=<literal>`，但它们仍按普通 fallback 执行，因此 Auto 不会额外询问。命令/进程替换、动态命令名、`eval`、`source`、Shell `-c`、运行时内联代码和无法解析的结构默认强制人工；无头 Ask/Auto/DontAsk 会拒绝这类未精确授权的命令，YOLO 可以绕过。高级用户可设置 `[permissions] allow_dynamic_bash = true`，让 Allow fallback（包括 Auto）覆盖这类动态命令；显式 `ask` 与 `deny` 规则仍然优先。由于无头运行没有审批界面，默认 Ask 对普通 writer fallback 和显式 ask 规则也会 fail closed；无人值守自动化需要放行普通 writer 时，使用 `reasonix run --auto ...`、`-y` 或 `--permission-mode auto`。配置的 `ask` 与 `deny` 始终优先。
 
 Ask 不是只读模式：writer 获得批准后仍会执行。Permissions 决定放行或询问，Sandbox 才是强制能力边界。
 Sandbox 是授权之后的第二层边界，不能替代命令解析，也不能把无法证明静态安全的命令变成可自动授权命令。

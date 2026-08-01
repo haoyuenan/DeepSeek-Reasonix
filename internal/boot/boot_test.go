@@ -39,6 +39,7 @@ import (
 
 	// Blank import registers the provider kind the same way cmd/reasonix's main
 	// does; importing builtin above registers the built-in tools.
+	_ "reasonix/internal/provider/anthropic"
 	_ "reasonix/internal/provider/openai"
 )
 
@@ -1050,8 +1051,8 @@ func (p *headlessTaskTestProvider) Stream(context.Context, provider.Request) (<-
 // TestBuildHeadlessApprovalModePropagatesToTaskSubagentGate pins boot.Build's
 // actual wiring for the fix: a `task` sub-agent spawned from a headless run
 // must honor the same --permission-mode contract as the parent executor
-// instead of the mode-unaware default gate (ask resolves to allow) that boot
-// used to build unconditionally. Auto must fail closed on write_file's
+// instead of the mode-unaware default gate that boot used to build
+// unconditionally. Ask and Auto must fail closed on write_file's
 // explicit ask rule even inside the sub-agent; only yolo may bypass it.
 func TestBuildHeadlessApprovalModePropagatesToTaskSubagentGate(t *testing.T) {
 	runTaskWriteOnce := func(t *testing.T, mode string) bool {
@@ -1092,6 +1093,9 @@ model = "x"
 		return statErr == nil
 	}
 
+	if written := runTaskWriteOnce(t, "ask"); written {
+		t.Fatalf("ask: task sub-agent wrote sub.txt despite having no approval UI")
+	}
 	if written := runTaskWriteOnce(t, "auto"); written {
 		t.Fatalf("auto: task sub-agent wrote sub.txt despite the explicit ask rule on write_file")
 	}
@@ -1176,7 +1180,7 @@ func TestRecoveryHeadlessModeUsesExplicitFrontendCapability(t *testing.T) {
 // later at runtime via Shift+Tab (Controller.SetToolApprovalMode) — followed
 // by a runtime switch to auto must also reach the task sub-agent's gate.
 // Before this fix, the sub-agent gate was captured once at boot with the
-// mode-unaware default (ask resolves to allow) and had no rebuild hook, so a
+// mode-unaware default and had no rebuild hook, so a
 // later SetToolApprovalMode(auto) call updated only the parent executor.
 func TestBuildInteractiveApprovalModeSwitchPropagatesToTaskSubagentGate(t *testing.T) {
 	isolateConfigHome(t)
@@ -1450,6 +1454,28 @@ func TestNewProviderAppliesModelReasoningProtocol(t *testing.T) {
 	thinking, ok := gotReq["thinking"].(map[string]any)
 	if !ok || thinking["type"] != "enabled" {
 		t.Fatalf("thinking = %#v, want enabled", gotReq["thinking"])
+	}
+}
+
+func TestNewProviderBuildsDeepSeekAnthropicPreset(t *testing.T) {
+	preset, ok := config.CuratedProviderPreset("deepseek-anthropic")
+	if !ok || len(preset.Entries) != 1 {
+		t.Fatalf("DeepSeek Anthropic preset = %+v", preset)
+	}
+	var cfg config.Config
+	if err := cfg.UpsertProvider(preset.Entries[0]); err != nil {
+		t.Fatalf("UpsertProvider: %v", err)
+	}
+	entry, ok := cfg.ResolveModel("deepseek-anthropic/deepseek-v4-flash")
+	if !ok {
+		t.Fatal("ResolveModel failed")
+	}
+	p, err := NewProvider(entry)
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	if p.Name() != "deepseek-anthropic" || !provider.RequiresToolCallReasoning(p) || provider.RequiresReasoningRoundTrip(p) {
+		t.Fatalf("assembled DeepSeek Anthropic provider = %T/%q policies=%v/%v", p, p.Name(), provider.RequiresToolCallReasoning(p), provider.RequiresReasoningRoundTrip(p))
 	}
 }
 
